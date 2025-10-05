@@ -15,6 +15,7 @@ import numpy as np
 import cv2.aruco as aruco
 import argparse
 from pathlib import Path
+import sys
 
 # -- Configurations --
 ID_TO_POS = {85: "tl", 90: "tr", 80: "bl", 95: "br"}
@@ -128,6 +129,8 @@ def Detection(image_path):
         f.write(f"Detected marker IDs: {ids.tolist()}\n")
         f.write(f"Infected plant in Block 1: P1{most_infected_b1}\n")
         f.write(f"Infected plant in Block 2: P2{most_infected_b2}\n")
+    
+    return 0
 
 
 def main():
@@ -141,7 +144,9 @@ def main():
     parser.add_argument('--image', type=str, required=True,
                         help="Path to the input image for analysis.")
     args = parser.parse_args()
+    
     Detection(args.image)
+    sys.exit(0)
 
 
 if __name__ == "__main__":
