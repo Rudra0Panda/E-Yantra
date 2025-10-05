@@ -6,8 +6,8 @@
 #                   3.Sidhartha Kumar Nayak
 #                   4.Subham Kumar Rana
 # Filename:         task1a.py
-# Functions:        split_area_into_plants, get_infection_score, Detection, main
-# Global variables: ID_TO_POS, WIDTH, HEIGHT, BLOCK_ROWS, BLOCK_COLS, HSV_YELLOW_RANGE
+# Functions:        find_plant_area, split_area_into_plants, get_infection_score, Detection, main
+# Global variables: ID_TO_POS, WIDTH, HEIGHT, BLOCK_ROWS, BLOCK_COLS, HSV_YELLOW_RANGE, HSV_BROWN_RANGE
 '''
 
 import cv2
@@ -22,18 +22,51 @@ ID_TO_POS = {85: "tl", 90: "tr", 80: "bl", 95: "br"}
 WIDTH, HEIGHT = 640, 500
 BLOCK_ROWS, BLOCK_COLS = 3, 2
 HSV_YELLOW_RANGE = (np.array([20, 100, 100]), np.array([35, 255, 255]))
+HSV_BROWN_RANGE = (np.array([10, 60, 40]), np.array([30, 255, 200]))
+
+
+def find_plant_area(roi):
+    '''
+    Purpose:
+    ---
+    Finds the PLANT area by determining which half of the ROI
+    contains the Most amount of brown "soil" pixels.
+    '''
+    # 1. Divide the ROI into left and right halves.
+    roi_h, roi_w = roi.shape[:2]
+    midpoint = roi_w // 2
+    left_half = roi[:, :midpoint]
+    right_half = roi[:, midpoint:]
+
+    # 2. Analyze the right half for soil content.
+    hsv_right = cv2.cvtColor(right_half, cv2.COLOR_BGR2HSV)
+    mask_right = cv2.inRange(hsv_right, HSV_BROWN_RANGE[0], HSV_BROWN_RANGE[1])
+    right_score = cv2.countNonZero(mask_right)
+
+    # 3. Analyze the left half for soil content.
+    hsv_left = cv2.cvtColor(left_half, cv2.COLOR_BGR2HSV)
+    mask_left = cv2.inRange(hsv_left, HSV_BROWN_RANGE[0], HSV_BROWN_RANGE[1])
+    left_score = cv2.countNonZero(mask_left)
+
+    # 4. Compare scores
+    if right_score > left_score:
+        return left_half
+    else:
+        return right_half
 
 
 def split_area_into_plants(area, rows=3, cols=2):
     '''
     Purpose:
     ---
-    Splits a given image area into a grid of smaller blocks.
+    Splits a given image area into a grid of smaller blocks and assigns a
+    pre-defined label to each block.
     '''
     h, w = area.shape[:2]
     block_h, block_w = h // rows, w // cols
     labels = [["A", "D"], ["B", "E"], ["C", "F"]]
     blocks = []
+
     for c in range(cols):
         for r in range(rows):
             block = area[r * block_h:(r + 1) * block_h, c * block_w:(c + 1) * block_w]
@@ -93,14 +126,10 @@ def Detection(image_path):
         cx, cy = np.mean(c, axis=0)
         if marker_id in ID_TO_POS:
             pos = ID_TO_POS[marker_id]
-            if pos == "tl":
-                pts_src[0] = [cx, cy]
-            elif pos == "tr":
-                pts_src[1] = [cx, cy]
-            elif pos == "bl":
-                pts_src[2] = [cx, cy]
-            elif pos == "br":
-                pts_src[3] = [cx, cy]
+            if pos == "tl": pts_src[0] = [cx, cy]
+            elif pos == "tr": pts_src[1] = [cx, cy]
+            elif pos == "bl": pts_src[2] = [cx, cy]
+            elif pos == "br": pts_src[3] = [cx, cy]
 
     # 5. Apply Perspective Transform
     pts_dst = np.array([[0, 0], [WIDTH - 1, 0], [0, HEIGHT - 1], [WIDTH - 1, HEIGHT - 1]], dtype="float32")
@@ -108,18 +137,20 @@ def Detection(image_path):
     roi = cv2.warpPerspective(image, M, (WIDTH, HEIGHT))
 
     # 6. Analyze the Region of Interest (ROI)
-    roi_h, roi_w = roi.shape[:2]
-    plant_area = roi[:, roi_w // 2:]
-    all_plants = split_area_into_plants(plant_area, BLOCK_ROWS, BLOCK_COLS)
+    plant_area = find_plant_area(roi)
 
-    infection_scores = []
-    for label, block in all_plants:
+    # The following analysis is now run on the plant area.
+    all_sections = split_area_into_plants(plant_area, BLOCK_ROWS, BLOCK_COLS)
+
+    section_scores = []
+    for label, block in all_sections:
         score = get_infection_score(block, HSV_YELLOW_RANGE)
-        infection_scores.append((label, score))
+        section_scores.append((label, score))
 
-    block1_results = infection_scores[:3]
-    block2_results = infection_scores[3:]
+    block1_results = section_scores[:3]
+    block2_results = section_scores[3:]
 
+    # The result now shows which section of the helipad has the most yellow pixels.
     most_infected_b1 = max(block1_results, key=lambda item: item[1])[0]
     most_infected_b2 = max(block2_results, key=lambda item: item[1])[0]
 
@@ -127,9 +158,9 @@ def Detection(image_path):
     Path("1894.txt").touch(exist_ok=True)
     with open("1894.txt", "w") as f:
         f.write(f"Detected marker IDs: {ids.tolist()}\n")
-        f.write(f"Infected plant in Block 1: P1{most_infected_b1}\n")
-        f.write(f"Infected plant in Block 2: P2{most_infected_b2}\n")
-    
+        f.write(print(f"Infected plant in Block 1: P1{most_infected_b1}\n"))
+        f.write(print(f"Infected plant in Block 2: P2{most_infected_b2}\n"))
+
     return 0
 
 
@@ -140,11 +171,11 @@ def main():
     This is the main entry point of the script. It parses the command-line
     arguments and calls the main detection function.
     '''
-    parser = argparse.ArgumentParser(description="KrishiDrone Plant Infection Detector")
+    parser = argparse.ArgumentParser(description="KrishiDrone Area Analyzer")
     parser.add_argument('--image', type=str, required=True,
                         help="Path to the input image for analysis.")
     args = parser.parse_args()
-    
+
     Detection(args.image)
     sys.exit(0)
 
