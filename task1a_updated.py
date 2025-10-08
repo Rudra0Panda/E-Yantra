@@ -14,7 +14,7 @@ HSV_YELLOW_RANGE = (np.array([20, 50, 100]), np.array([35, 255, 255]))
 # ---------------------- Helper Functions ---------------------- #
 
 def find_and_warp_aruco(image):
-    """Detects ArUco markers and performs perspective warping if possible."""
+    """Detects ArUco markers. Returns warped image on success or None on failure."""
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (5, 5), 1)
 
@@ -31,8 +31,10 @@ def find_and_warp_aruco(image):
     detector = aruco.ArucoDetector(aruco_dict, parameters)
     corners, ids, _ = detector.detectMarkers(gray)
 
+    # --- MODIFIED: Return None on failure instead of raising an error ---
     if ids is None or len(ids) < 4:
-        raise RuntimeError("❌ Detection failed: Need at least 4 ArUco markers.")
+        print(f"⚠️ Safety Return: Found {len(ids) if ids is not None else 0} markers, but need at least 4 to proceed.")
+        return None, None
 
     centers = np.array([c[0].mean(axis=0) for c in corners])
     sums = centers.sum(axis=1)
@@ -106,24 +108,32 @@ def analyze_region_infection(region_image):
     most_infected_label = max(infection_scores, key=lambda item: item[1])[0]
     return most_infected_label
 
-
 # ---------------------- Main Detection Function ---------------------- #
 
 def Detection(image_path):
     """
     Main function to run the complete plant infection detection pipeline.
     """
+    output_filename = "1894.txt"
     image = cv2.imread(image_path)
     if image is None:
         print(f"❌ Fatal Error: Could not read image from '{image_path}'.")
         return 1  # Return error code
 
-    try:
-        warped_arena, detected_ids = find_and_warp_aruco(image)
-    except RuntimeError as e:
-        print(e)
-        return 1
+    # Attempt to detect markers and warp the image
+    warped_arena, detected_ids = find_and_warp_aruco(image)
 
+    # --- NEW: Safety return check ---
+    if warped_arena is None:
+        # This block executes if find_and_warp_aruco failed (found < 4 markers)
+        with open(output_filename, "w") as f:
+            f.write("Detected marker IDs: N/A\n")
+            f.write("Infected plant in Block 1: N/A\n")
+            f.write("Infected plant in Block 2: N/A\n")
+        print(f"⚠️ Safety file '{output_filename}' created due to insufficient ArUco markers.")
+        return 0 # Exit successfully after creating the safety file
+
+    # --- Full pipeline (only runs if 4+ markers were found) ---
     warped_arena = cv2.flip(warped_arena, 1)
 
     mid_point_y = warped_arena.shape[0] // 2
@@ -139,12 +149,7 @@ def Detection(image_path):
 
     mid_point_x = plant_area_half.shape[1] // 2
     left_region = plant_area_half[:, :mid_point_x]
-
-    # --- BUG FIX ---
-    # The original line was a copy-paste error. This corrected line
-    # correctly slices the right half of the image.
     right_region = plant_area_half[:, mid_point_x:]
-    # --- END FIX ---
 
     if left_region.size == 0 or right_region.size == 0:
         print("❌ Error: Failed to split plant area into two regions.")
@@ -159,9 +164,7 @@ def Detection(image_path):
     print(f" Infection found in Block 1 at position: P1{most_infected_b1}")
     print(f" Infection found in Block 2 at position: P2{most_infected_b2}")
 
-    # --- Write Results to File ---
-    output_filename = "1894.txt"
-    Path(output_filename).touch(exist_ok=True)
+    # Write the actual results to the file
     with open(output_filename, "w") as f:
         f.write(f"Detected marker IDs: {detected_ids.tolist()}\n")
         f.write(f"Infected plant in Block 1: P1{most_infected_b1}\n")
@@ -169,7 +172,6 @@ def Detection(image_path):
 
     print(f"✅ Analysis complete. Results saved to {output_filename}")
     return 0
-
 
 # ---------------------- Entry Point ---------------------- #
 
