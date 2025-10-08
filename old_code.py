@@ -13,53 +13,56 @@ HSV_YELLOW_RANGE = (np.array([20, 50, 100]), np.array([35, 255, 255]))
 
 # ---------------------- Helper Functions ---------------------- #
 
-def find_and_warp_aruco(image):
-    """Detects ArUco markers and performs perspective warping if possible."""
+import cv2
+import cv2.aruco as aruco
+import numpy as np
+
+# --- Standalone Debugging Script ---
+
+def debug_aruco_detection(image_path):
+    """A focused function to test and visualize ArUco detection."""
+    image = cv2.imread(image_path)
+    if image is None:
+        print(f"Error: Could not load image at {image_path}")
+        return
+
+    print("Attempting to detect markers with default parameters...")
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (5, 5), 1)
-
+    
+    # 1. Use the correct dictionary
     aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_100)
-
-    # --- CHANGE 1: Use DetectorParameters_create() for OpenCV 3.x ---
-    # The modern `aruco.DetectorParameters()` class is not available in v3.
+    
+    # 2. Use default parameters for maximum compatibility
     parameters = aruco.DetectorParameters_create()
 
-    # Setting parameters remains the same.
-    parameters.cornerRefinementMethod = aruco.CORNER_REFINE_SUBPIX
-    parameters.adaptiveThreshWinSizeMin = 3
-    parameters.adaptiveThreshWinSizeMax = 40
-    parameters.adaptiveThreshWinSizeStep = 4
-    parameters.adaptiveThreshConstant = 7
-    parameters.minMarkerPerimeterRate = 0.02
-    parameters.polygonalApproxAccuracyRate = 0.04
+    # 3. Perform detection
+    corners, ids, rejectedImgPoints = aruco.detectMarkers(gray, aruco_dict, parameters=parameters)
 
-    # --- CHANGE 2: Use the direct detectMarkers function ---
-    # OpenCV 3.x does not use the `ArucoDetector` class. Detection is a direct function call.
-    corners, ids, _ = aruco.detectMarkers(gray, aruco_dict, parameters=parameters)
+    if ids is not None:
+        print(f"✅ SUCCESS: Found {len(ids)} markers. IDs: {ids.flatten()}")
+        # Draw detected markers on the image
+        aruco.drawDetectedMarkers(image, corners, ids)
+    else:
+        print("❌ FAILURE: No markers were detected.")
+        # Optionally, draw the rejected candidates to see what it *thought* might be a marker
+        if rejectedImgPoints:
+            print(f"Found {len(rejectedImgPoints)} rejected candidates. Visualizing them in red.")
+            aruco.drawDetectedMarkers(image, rejectedImgPoints, borderColor=(0, 0, 255))
 
-    if ids is None or len(ids) < 4:
-        raise RuntimeError("❌ Detection failed: Need at least 4 ArUco markers.")
+    # 4. Display the result
+    # Resize for display if the image is very large
+    h, w, _ = image.shape
+    display_h = 800
+    display_w = int(w * (display_h / h))
+    cv2.imshow("ArUco Detection Debug", cv2.resize(image, (display_w, display_h)))
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
 
-    centers = np.array([c[0].mean(axis=0) for c in corners])
-    sums = centers.sum(axis=1)
-    diffs = np.diff(centers, axis=1)
 
-    top_left_idx, bottom_right_idx = np.argmin(sums), np.argmax(sums)
-    top_right_idx, bottom_left_idx = np.argmax(diffs), np.argmin(diffs)
-
-    pts_src = np.zeros((4, 2), dtype=np.float32)
-    pts_src[0] = corners[top_left_idx][0][0]
-    pts_src[1] = corners[top_right_idx][0][1]
-    pts_src[2] = corners[bottom_right_idx][0][2]
-    pts_src[3] = corners[bottom_left_idx][0][3]
-
-    pts_dst = np.array([[0, 0], [WIDTH - 1, 0], [WIDTH - 1, HEIGHT - 1], [0, HEIGHT - 1]], dtype=np.float32)
-    M = cv2.getPerspectiveTransform(pts_src, pts_dst)
-    warped = cv2.warpPerspective(image, M, (WIDTH, HEIGHT))
-
-    print(f"✅ ArUco markers detected: {len(ids)} -> IDs: {ids.flatten()}")
-    return warped, ids.flatten()
-
+# --- RUN THE DEBUGGER ---
+# ❗️❗️❗️ CHANGE THIS TO YOUR IMAGE PATH ❗️❗️❗️
+your_image_file = "path/to/your/image.jpg" 
+debug_aruco_detection(your_image_file)
 
 def find_soil_area(half_image):
     """Counts brown/soil pixels to identify the half of the image with the plant area."""
