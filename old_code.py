@@ -131,7 +131,7 @@ def Detection(image_path):
         return 1  # Return error code
 
     try:
-        warped_arena, detected_ids = find_and_warp_aruco(image)
+        warped_arena, detected_ids = debug_aruco_detection(image)
     except RuntimeError as e:
         print(e)
         return 1
