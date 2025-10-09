@@ -17,6 +17,8 @@ def Detection(image_path):
     # A centralized class to hold all tunable parameters.
     class Config:
         WIDTH, HEIGHT = 800, 800
+        HSV_GREEN_LOWER = np.array([35, 50, 50])
+        HSV_GREEN_UPPER = np.array([85, 255, 255])
         HSV_YELLOW_LOWER = np.array([20, 50, 100])
         HSV_YELLOW_UPPER = np.array([35, 255, 255])
         HSV_BROWN_LOWER = np.array([10, 50, 20])
@@ -35,33 +37,35 @@ def Detection(image_path):
 
     # Helper function to find and warp the image based on ArUco markers.
     def find_and_warp_aruco(image):
+        """Detects four specific ArUco markers and performs precise perspective correction."""
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        clahe = cv2.createCLAHE(clipLimit=Config.CLAHE_CLIP_LIMIT, tileGridSize=Config.CLAHE_GRID_SIZE)
-        gray = clahe.apply(gray)
         corners, ids, _ = aruco.detectMarkers(gray, Config.ARUCO_DICT, parameters=Config.ARUCO_PARAMS)
 
         if ids is None or len(ids) < 4:
-            # Return None if detection fails, to be handled by the main logic
+            print("❌ Not enough ArUco markers detected!")
             return None, None
 
-        centers = np.array([c[0].mean(axis=0) for c in corners])
-        sums = centers.sum(axis=1)
-        diffs = np.diff(centers, axis=1)
-        top_left_idx, bottom_right_idx = np.argmin(sums), np.argmax(sums)
-        top_right_idx, bottom_left_idx = np.argmax(diffs), np.argmin(diffs)
+        ids = ids.flatten()
+        marker_dict = {id_: corner.reshape(4, 2) for id_, corner in zip(ids, corners)}
 
-        pts_src = np.array([
-            corners[top_left_idx][0][0], corners[top_right_idx][0][1],
-            corners[bottom_right_idx][0][2], corners[bottom_left_idx][0][3]
-        ], dtype=np.float32)
+        required_ids = [80, 85, 90, 95]
+        if not all(id_ in marker_dict for id_ in required_ids):
+            print(f"⚠️ Not all required ArUco IDs found! Detected: {ids}")
+            return None, None
 
-        pts_dst = np.array([
+        top_left = marker_dict[80][0]
+        top_right = marker_dict[85][1]
+        bottom_right = marker_dict[90][2]
+        bottom_left = marker_dict[95][3]
+
+        src_pts = np.array([top_left, top_right, bottom_right, bottom_left], dtype=np.float32)
+        dst_pts = np.array([
             [0, 0], [Config.WIDTH - 1, 0],
             [Config.WIDTH - 1, Config.HEIGHT - 1], [0, Config.HEIGHT - 1]
         ], dtype=np.float32)
 
-        M = cv2.getPerspectiveTransform(pts_src, pts_dst)
-        warped = cv2.warpPerspective(image, M, (Config.WIDTH, Config.HEIGHT))
+        matrix = cv2.getPerspectiveTransform(src_pts, dst_pts)
+        warped = cv2.warpPerspective(image, matrix, (Config.WIDTH, Config.HEIGHT))
         return warped, ids
 
     # Helper function to count soil pixels.
@@ -79,7 +83,7 @@ def Detection(image_path):
         cl = clahe.apply(l)
         return cv2.cvtColor(cv2.merge((cl, a, b)), cv2.COLOR_LAB2BGR)
 
-    # Helper function to analyze each region for infection.
+    # Function to analyze each region for infection.
     def analyze_region_infection(region_image):
         h, w, _ = region_image.shape
         block_h, block_w = h // 3, w // 2
@@ -114,8 +118,11 @@ def Detection(image_path):
         print("❌ Detection failed: Need at least 4 ArUco markers.")
         return 1
 
+    # --- The unconditional global flip is REMOVED from here ---
+    # warped_arena = cv2.flip(warped_arena, 1) # This line is removed
+
+
     print(f"✅ ArUco markers detected: {len(ids)} -> IDs: {ids.flatten()}")
-    warped_arena = cv2.flip(warped_arena, 1)
 
     mid_y = warped_arena.shape[0] // 2
     top_half, bottom_half = warped_arena[:mid_y, :], warped_arena[mid_y:, :]
@@ -127,7 +134,10 @@ def Detection(image_path):
         plant_area_half = top_half
         print("🌱 Plant trays identified in the TOP half.")
 
-    mid_x = plant_area_half.shape[1] // 2
+    # --- The previous flip operation on plant_area_half is also REMOVED ---
+    # plant_area_half = cv2.flip(plant_area_half, 1) # This line is removed
+
+    mid_x = plant_area_half.shape[1] // 2 # Corrected variable name from mid_x1 to mid_x
     left_region, right_region = plant_area_half[:, :mid_x], plant_area_half[:, mid_x:]
 
     print("🔬 Enhancing image contrast and analyzing for infection...")
@@ -157,7 +167,6 @@ def main():
     parser.add_argument('--image', type=str, required=True, help="Path to the input image file.")
     args = parser.parse_args()
 
-    # Exit with the return code from the Detection function
     sys.exit(Detection(args.image))
 
 
