@@ -5,165 +5,172 @@ import argparse
 from pathlib import Path
 import sys
 
+# --- Main Configurations ---
+WIDTH, HEIGHT = 800, 800
+HSV_YELLOW_RANGE = (np.array([20, 50, 100]), np.array([35, 255, 255]))
 
-def Detection(image_path):
-    """
-    Main detection function that encapsulates all logic: loading, warping,
-    enhancing, filtering, analyzing, and writing the result to a file.
-    """
 
-    # --- All configurations and helper functions are now nested inside ---
+# ---------------------- Helper Functions ---------------------- #
 
-    class Config:
-        WIDTH, HEIGHT = 800, 800
-        HSV_GREEN_LOWER = np.array([35, 50, 50])
-        HSV_GREEN_UPPER = np.array([85, 255, 255])
-        HSV_YELLOW_LOWER = np.array([20, 50, 100])
-        HSV_YELLOW_UPPER = np.array([35, 255, 255])
-        HSV_BROWN_LOWER = np.array([10, 50, 20])
-        HSV_BROWN_UPPER = np.array([30, 255, 200])
-        ARUCO_DICT = aruco.getPredefinedDictionary(aruco.DICT_4X4_100)
-        ARUCO_PARAMS = aruco.DetectorParameters_create()
-        ARUCO_PARAMS.cornerRefinementMethod = aruco.CORNER_REFINE_SUBPIX
-        ARUCO_PARAMS.adaptiveThreshWinSizeMin = 3
-        ARUCO_PARAMS.adaptiveThreshWinSizeMax = 23
-        ARUCO_PARAMS.adaptiveThreshWinSizeStep = 2
-        ARUCO_PARAMS.adaptiveThreshConstant = 5
-        CLAHE_CLIP_LIMIT = 2.0
-        CLAHE_GRID_SIZE = (8, 8)
-        MORPH_KERNEL = np.ones((3, 3), np.uint8)
-        MORPH_ITERATIONS = 2
+def find_and_warp_aruco(image):
+    """Detects ArUco markers and performs perspective warping using older API."""
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    gray = clahe.apply(gray)
 
-    def find_and_warp_aruco(image):
-        """Detects four specific ArUco markers and performs precise perspective correction."""
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        corners, ids, _ = aruco.detectMarkers(gray, Config.ARUCO_DICT, parameters=Config.ARUCO_PARAMS)
+    aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_100)
+    parameters = aruco.DetectorParameters_create()
 
-        if ids is None or len(ids) < 4:
-            print("❌ Not enough ArUco markers detected!")
-            return None, None
+    parameters.cornerRefinementMethod = aruco.CORNER_REFINE_SUBPIX
+    parameters.adaptiveThreshWinSizeMin = 3
+    parameters.adaptiveThreshWinSizeMax = 23
+    parameters.adaptiveThreshWinSizeStep = 2
+    parameters.adaptiveThreshConstant = 5
 
-        ids = ids.flatten()
-        marker_dict = {id_: corner.reshape(4, 2) for id_, corner in zip(ids, corners)}
-        required_ids = [80, 85, 90, 95]
-        if not all(id_ in marker_dict for id_ in required_ids):
-            print(f"⚠️ Not all required ArUco IDs found! Detected: {ids}")
-            return None, None
+    corners, ids, _ = aruco.detectMarkers(gray, aruco_dict, parameters=parameters)
 
-        top_left = marker_dict[80][0]
-        top_right = marker_dict[85][1]
-        bottom_right = marker_dict[90][2]
-        bottom_left = marker_dict[95][3]
+    if ids is None or len(ids) < 4:
+        raise RuntimeError("❌ Detection failed: Need at least 4 ArUco markers.")
 
-        src_pts = np.array([top_left, top_right, bottom_right, bottom_left], dtype=np.float32)
-        dst_pts = np.array([[0, 0], [Config.WIDTH - 1, 0], [Config.WIDTH - 1, Config.HEIGHT - 1], [0, Config.HEIGHT - 1]], dtype=np.float32)
-        matrix = cv2.getPerspectiveTransform(src_pts, dst_pts)
-        warped = cv2.warpPerspective(image, matrix, (Config.WIDTH, Config.HEIGHT))
-        
-        # --- VISUALIZATION ADDED ---
-        cv2.imshow("1. Warped Arena", warped)
-        
-        return warped, ids
+    # Draw markers for visualization
+    aruco.drawDetectedMarkers(image, corners, ids)
 
-    def find_soil_area(half_image):
-        if half_image.size == 0: return 0
-        hsv = cv2.cvtColor(half_image, cv2.COLOR_BGR2HSV)
-        soil_mask = cv2.inRange(hsv, Config.HSV_BROWN_LOWER, Config.HSV_BROWN_UPPER)
-        return np.sum(soil_mask)
+    centers = np.array([c[0].mean(axis=0) for c in corners])
+    sums = centers.sum(axis=1)
+    diffs = np.diff(centers, axis=1)
 
-    def apply_clahe(image):
-        lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
-        l, a, b = cv2.split(lab)
-        clahe = cv2.createCLAHE(clipLimit=Config.CLAHE_CLIP_LIMIT, tileGridSize=Config.CLAHE_GRID_SIZE)
-        cl = clahe.apply(l)
-        return cv2.cvtColor(cv2.merge((cl, a, b)), cv2.COLOR_LAB2BGR)
+    top_left_idx, bottom_right_idx = np.argmin(sums), np.argmax(sums)
+    top_right_idx, bottom_left_idx = np.argmax(diffs), np.argmin(diffs)
 
-    def analyze_region_infection(region_image):
-        h, w, _ = region_image.shape
-        block_h, block_w = h // 3, w // 2
-        labels = [["A", "D"], ["B", "E"], ["C", "F"]]
-        cell_analysis_results = []
-        for c in range(2):
-            for r in range(3):
-                x, y = c * block_w, r * block_h
-                cell = region_image[y:y + block_h, x:x + block_w]
-                hsv = cv2.cvtColor(cell, cv2.COLOR_BGR2HSV)
-                mask = cv2.inRange(hsv, Config.HSV_YELLOW_LOWER, Config.HSV_YELLOW_UPPER)
-                mask_cleaned = cv2.morphologyEx(mask, cv2.MORPH_OPEN, Config.MORPH_KERNEL, iterations=Config.MORPH_ITERATIONS)
-                score = cv2.countNonZero(mask_cleaned)
-                cell_analysis_results.append({"label": labels[r][c], "score": score})
-        if not cell_analysis_results:
-            return "N/A"
-        most_infected_cell = max(cell_analysis_results, key=lambda x: x["score"])
-        return most_infected_cell['label']
+    pts_src = np.zeros((4, 2), dtype=np.float32)
+    pts_src[0] = corners[top_left_idx][0][0]
+    pts_src[1] = corners[top_right_idx][0][1]
+    pts_src[2] = corners[bottom_right_idx][0][2]
+    pts_src[3] = corners[bottom_left_idx][0][3]
 
-    # --- Main Pipeline Logic ---
-    image = cv2.imread(image_path)
-    if image is None:
-        print(f"❌ Error: Could not read image from '{image_path}'.")
-        return 1
-
-    # --- VISUALIZATION ADDED ---
-    cv2.imshow("0. Original Input", image)
-
-    warped_arena, ids = find_and_warp_aruco(image)
-    if warped_arena is None:
-        print("❌ Detection failed: Need at least 4 ArUco markers.")
-        return 1
+    pts_dst = np.array([[0, 0], [WIDTH - 1, 0], [WIDTH - 1, HEIGHT - 1], [0, HEIGHT - 1]], dtype=np.float32)
+    M = cv2.getPerspectiveTransform(pts_src, pts_dst)
+    warped = cv2.warpPerspective(image, M, (WIDTH, HEIGHT))
 
     print(f"✅ ArUco markers detected: {len(ids)} -> IDs: {ids.flatten()}")
+    return warped, ids.flatten()
 
+
+def find_soil_area(half_image):
+    """Counts brown/soil pixels to identify the plant area half."""
+    if half_image.size == 0: return 0
+    hsv = cv2.cvtColor(half_image, cv2.COLOR_BGR2HSV)
+    lower_brown = np.array([10, 50, 20])
+    upper_brown = np.array([30, 255, 200])
+    soil_mask = cv2.inRange(hsv, lower_brown, upper_brown)
+    return np.sum(soil_mask)
+
+
+def apply_clahe(image):
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    cl = clahe.apply(l)
+    return cv2.cvtColor(cv2.merge((cl, a, b)), cv2.COLOR_LAB2BGR)
+
+
+def analyze_region_infection(region_image, prefix="P1"):
+    """Splits a region into 3x2 grid and finds cell with largest infection."""
+    h, w, _ = region_image.shape
+    block_h, block_w = h // 3, w // 2
+    labels = [["A", "D"], ["B", "E"], ["C", "F"]]
+    infection_scores = []
+
+    visual = region_image.copy()
+
+    for c in range(2):
+        for r in range(3):
+            cell = region_image[r * block_h:(r + 1) * block_h, c * block_w:(c + 1) * block_w]
+            label = labels[r][c]
+            hsv = cv2.cvtColor(cell, cv2.COLOR_BGR2HSV)
+            mask = cv2.inRange(hsv, HSV_YELLOW_RANGE[0], HSV_YELLOW_RANGE[1])
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            score = 0
+            if contours:
+                score = max([cv2.contourArea(cnt) for cnt in contours])
+                cv2.drawContours(cell, contours, -1, (0, 255, 255), 1)
+
+            # Label and border
+            cv2.rectangle(visual, (c * block_w, r * block_h),
+                          ((c + 1) * block_w, (r + 1) * block_h), (255, 0, 0), 2)
+            cv2.putText(visual, f"{prefix}{label}", (c * block_w + 10, r * block_h + 25),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            infection_scores.append((label, score))
+
+    if not infection_scores:
+        return "N/A", visual
+
+    most_infected = max(infection_scores, key=lambda x: x[1])[0]
+    print(f"🦠 {prefix}{most_infected} has the highest infection score.")
+
+    # Highlight infected region
+    for c in range(2):
+        for r in range(3):
+            if labels[r][c] == most_infected:
+                cv2.rectangle(visual, (c * block_w, r * block_h),
+                              ((c + 1) * block_w, (r + 1) * block_h), (0, 0, 255), 4)
+    return most_infected, visual
+
+
+# ---------------------- Main Detection Function ---------------------- #
+
+def Detection(image_path):
+    image = cv2.imread(image_path)
+    if image is None:
+        print(f"❌ Could not read image from '{image_path}'.")
+        return 1
+
+    try:
+        warped_arena, detected_ids = find_and_warp_aruco(image)
+    except RuntimeError as e:
+        print(e)
+        return 1
+
+    warped_arena = cv2.flip(warped_arena, 1)
     mid_y = warped_arena.shape[0] // 2
     top_half, bottom_half = warped_arena[:mid_y, :], warped_arena[mid_y:, :]
 
     if find_soil_area(bottom_half) > find_soil_area(top_half):
-        plant_area_half = bottom_half
+        plant_area_half = top_half
         print("🌱 Plant trays identified in the BOTTOM half.")
     else:
-        plant_area_half = top_half
+        plant_area_half = bottom_half
         print("🌱 Plant trays identified in the TOP half.")
 
-    # --- VISUALIZATION ADDED ---
-    cv2.imshow("2. Extracted Plant Half", plant_area_half)
+    left_region = plant_area_half[66:333, 110:341]
+    right_region = plant_area_half[66:333, 460:690]
 
-    mid_x = plant_area_half.shape[1] // 2
-    left_region, right_region = plant_area_half[:, :mid_x], plant_area_half[:, mid_x:]
-
-    print("🔬 Enhancing image contrast and analyzing for infection...")
     left_enhanced = apply_clahe(left_region)
     right_enhanced = apply_clahe(right_region)
 
-    # --- VISUALIZATION ADDED ---
-    cv2.imshow("3a. Left Region (Enhanced)", left_enhanced)
-    cv2.imshow("3b. Right Region (Enhanced)", right_enhanced)
+    most_infected_b1, vis1 = analyze_region_infection(left_enhanced, "P1")
+    most_infected_b2, vis2 = analyze_region_infection(right_enhanced, "P2")
 
-    most_infected_b1 = analyze_region_infection(left_enhanced)
-    most_infected_b2 = analyze_region_infection(right_enhanced)
+    print(f"Infection found in Block 1 at position: P1{most_infected_b1}")
+    print(f"Infection found in Block 2 at position: P2{most_infected_b2}")
 
-    print(f"📊 Infection found in Block 1 at position: P1{most_infected_b1}")
-    print(f"📊 Infection found in Block 2 at position: P2{most_infected_b2}")
-
-    print("✅ Analysis complete. Writing results to 1894.txt...")
-    Path("1894.txt").touch(exist_ok=True)
-    with open("1894.txt", "w") as f:
-        f.write(f"Detected marker IDs: {ids.flatten().tolist()}\n")
+    # --- Save results to file ---
+    output_file = "1894.txt"
+    Path(output_file).touch(exist_ok=True)
+    with open(output_file, "w") as f:
+        f.write(f"Detected marker IDs: {detected_ids.tolist()}\n")
         f.write(f"Infected plant in Block 1: P1{most_infected_b1}\n")
         f.write(f"Infected plant in Block 2: P2{most_infected_b2}\n")
 
-    # --- FINAL VISUALIZATION STEP ---
-    # This will display all the windows created above and wait for a key press
-    print("\n✅ All image processing steps are displayed.")
-    print("Press any key on any image window to close all windows and exit.")
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
-    
+    print(f"✅ Analysis complete. Results saved to {output_file}")
     return 0
 
 
+# ---------------------- Entry Point ---------------------- #
+
 def main():
-    """Parses command-line arguments and calls the main detection function."""
-    parser = argparse.ArgumentParser(description="Detect infected plants and write results to a file.")
-    parser.add_argument('--image', type=str, required=True, help="Path to the input image file.")
+    parser = argparse.ArgumentParser(description="Detect infected plants from an image.")
+    parser.add_argument('--image', type=str, required=True, help="Path to input image.")
     args = parser.parse_args()
     sys.exit(Detection(args.image))
 
