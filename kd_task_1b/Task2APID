@@ -9,7 +9,6 @@ import math
 
 
 class SwiftPico(Node):
-    """ROS2 node for autonomous waypoint navigation using PID control."""
 
     def __init__(self):
         super().__init__('pico_controller')
@@ -56,14 +55,13 @@ class SwiftPico(Node):
         self.cmd_pub = self.create_publisher(SwiftMsgs, '/drone_command', 10)
         self.pose_sub = self.create_subscription(PoseArray, '/whycon/poses', self.pose_callback, 10)
 
-        # Control loop timer
         self.timer = self.create_timer(0.05, self.pid_loop)
 
         # Initialize state
         self.current_state = [0.0, 0.0, 0.0]
         self.last_time = self.get_clock().now().nanoseconds * 1e-9
 
-        self.get_logger().info("✅ SwiftPico PID Controller initialized.")
+        self.get_logger().info(" SwiftPico PID Controller initialized.")
 
     # ---------------- Pose callback ---------------- #
     def pose_callback(self, msg):
@@ -79,7 +77,6 @@ class SwiftPico(Node):
 
         target = self.waypoints[self.current_wp]
 
-        # Smooth transition toward target
         alpha = 0.12
         self.desired_state = [
             self.desired_state[i] + alpha * (target[i] - self.desired_state[i])
@@ -90,7 +87,6 @@ class SwiftPico(Node):
         dt = min(max(now - self.last_time, 0.002), 0.05)
         self.last_time = now
 
-        # Compute PID for X, Y, Z
         outputs = []
         for i in range(3):
             error = self.desired_state[i] - self.current_state[i]
@@ -106,7 +102,6 @@ class SwiftPico(Node):
             outputs.append(output)
             self.prev_error[i] = error
 
-        # Compute desired yaw
         dx = target[0] - self.current_state[0]
         dy = target[1] - self.current_state[1]
         desired_yaw = math.degrees(math.atan2(dy, dx))
