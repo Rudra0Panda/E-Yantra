@@ -12,6 +12,7 @@ from controller_msg.msg import PIDTune
 from error_msg.msg import Error
 from geometry_msgs.msg import Vector3
 
+
 class Swift_Pico(Node):
     def __init__(self):
         super().__init__('pico_controller')
@@ -21,9 +22,9 @@ class Swift_Pico(Node):
         self.desired_state = [-0, 0, 0]
 
         # --- PID constants (unchanged) ---
-        self.Kp = [0.0, 0.0, 32]
-        self.Ki = [0.0, 0.0, 0]
-        self.Kd = [0.0, 0.0, 58]
+        self.Kp = [4.0, 2.5, 70.0]
+        self.Ki = [1.0, 0.0, 3.0]
+        self.Kd = [2.0, 6.0, 38.0]            #roll{0},pitch{1}
 
         # --- Internal PID state ---
         self.prev_error = [0.0, 0.0, 0.0]
@@ -39,12 +40,12 @@ class Swift_Pico(Node):
         self.min_values = [1000, 1000, 1000]
 
         # --- Control Timing ---
-        self.sample_time = 0.03  # 25 
+        self.sample_time = 0.03  # 25
         self.last_time = self.get_clock().now().nanoseconds / 1e9
 
         # --- Fixed filter/smoothing constants ---
-        self.alpha = 0.20 # output smoothing (higher = smoother, slower)
-        self.beta = 0.80   # derivative low-pass filter
+        self.alpha = 0.20  # output smoothing (higher = smoother, slower)
+        self.beta = 0.80  # derivative low-pass filter
         self.integral_limit = 80.0
         self.deadband = 0.10
 
@@ -58,8 +59,6 @@ class Swift_Pico(Node):
         self.create_subscription(PIDTune, '/pitch_pid', self.pitch_set_pid, 1)
         self.create_subscription(PIDTune, '/roll_pid', self.roll_set_pid, 1)
         self.create_subscription(Vector3, '/desired_state', self.updateDesiredState, 1)
-        
-
 
         # --- Arm and start control ---
         self.arm()
@@ -141,11 +140,17 @@ class Swift_Pico(Node):
 
         # Compute for each axis
         out_x, ex, self.error_sum[0], self.diff_x = compute_pid(0, self.desired_state[0], self.current_state[0],
-                                                                self.prev_error[0], self.error_sum[0], getattr(self, "diff_x", 0.0))
-        out_y, ey, self.error_sum[1], self.diff_y = compute_pid(1, self.desired_state[1], self.current_state[1],
-                                                                self.prev_error[1], self.error_sum[1], getattr(self, "diff_y", 0.0))
+                                                                self.prev_error[0], self.error_sum[0],
+                                                                getattr(self, "diff_x", 0.0))
+        out_y, ey, self.error_sum[1], self.diff_y = compute_pid(
+            1, self.current_state[1], self.desired_state[1],  # 🔄 swapped
+            self.prev_error[1], self.error_sum[1],
+            getattr(self, "diff_y", 0.0)
+        )
+
         out_z, ez, self.error_sum[2], self.diff_z = compute_pid(2, self.desired_state[2], self.current_state[2],
-                                                                self.prev_error[2], self.error_sum[2], getattr(self, "diff_z", 0.0))
+                                                                self.prev_error[2], self.error_sum[2],
+                                                                getattr(self, "diff_z", 0.0))
 
         # RC mapping
         rc_thr = 1500 - out_z
