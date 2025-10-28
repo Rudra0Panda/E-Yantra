@@ -29,7 +29,7 @@ class Swift_Pico(Node):
         self.Ki = [0.25, 0.0, 2.0]
         self.Kd = [2.8, 8.0, 52.0]
 
-        # --- Internal PID state ---
+        # --- Internal PID state --
         self.prev_error = [0.0, 0.0, 0.0]
         self.error_sum = [0.0, 0.0, 0.0]
         self.prev_output = [1500, 1500, 1500]
