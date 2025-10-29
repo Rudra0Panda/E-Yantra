@@ -156,8 +156,6 @@ class Swift_Pico(Node):
         dt = max(self.sample_time, now - self.last_time)
         self.last_time = now
 
-        print(f"x:{prev}")
-
         def safe_num(x, default=0.0):
             try:
                 if x is None:
@@ -210,7 +208,7 @@ class Swift_Pico(Node):
                       self.Kd[axis] * diff_filtered)
             return float(output), float(error), float(err_sum), float(diff_filtered)
 
-
+            
 
 
         # --- Compute Pitch and Roll ---
@@ -253,7 +251,7 @@ class Swift_Pico(Node):
         throttle_integrate = not (horiz_err > horizontal_motion_threshold or pitch_activity > pitch_activity_threshold)
 
         thr_err_sum = safe_num(self.error_sum[2], 0.0)
-
+        
         out_z_tmp, ez_tmp, _, diff_z_tmp = compute_pid(
             2, self.desired_state[2], self.current_state[2],
             self.prev_error[2], thr_err_sum,
