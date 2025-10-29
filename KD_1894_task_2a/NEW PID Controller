@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """
 Stable ROS2 PID controller for Swift Pico drone.
-Fixed smoothing/filter values for consistent tuning and minimal oscillation.
-Includes robust guards against None/NaN derivative values and throttle freeze during horizontal motion.
+FINAL TUNING: Pitch, Roll, and Throttle tuned for critical damping and high performance.
+Derivative Noise in Throttle (Z) fixed using a targeted, higher-order filter coefficient (beta=0.98).
 """
 
 import math
 import rclpy
 from rclpy.node import Node
+# ----------------- NEW IMPORTS FOR YAW CONTROL -----------------
+from nav_msgs.msg import Odometry
+from tf_transformations import euler_from_quaternion
+# ---------------------------------------------------------------
 from swift_msgs.msg import SwiftMsgs
 from geometry_msgs.msg import PoseArray
 from controller_msg.msg import PIDTune
@@ -19,43 +23,51 @@ class Swift_Pico(Node):
     def __init__(self):
         super().__init__('pico_controller')
 
-        # --- Desired vs Current ---
+        # --- Desired vs Current (X, Y, Z, Yaw) ---
         self.current_state = [0.0, 0.0, 0.0]
         self.desired_state = [0.0, 0.0, 0.0]
+        self.current_yaw = 0.0
 
-        # --- PID constants (tuned for stability) ---
-        # [Pitch (X), Roll (Y), Throttle (Z)]
-        self.Kp = [4.8, 2.5, 65.0]
-        self.Ki = [0.25, 0.0, 2.0]
-        self.Kd = [2.8, 8.0, 52.0]
+        # --- DYNAMIC YAW BASELINE FIX ---
+        self.desired_yaw = None
+        self.initial_yaw_set = False
+        # --------------------------------
 
-        # --- Internal PID state --
-        self.prev_error = [0.0, 0.0, 0.0]
-        self.error_sum = [0.0, 0.0, 0.0]
-        self.prev_output = [1500, 1500, 1500]
+        # --- PID constants (FINAL CRITICALLY DAMPED GAINS) ---
+        # [Pitch (X), Roll (Y), Throttle (Z), Yaw (Index 3)]
+        self.Kp = [8.0, 6.0, 16.0, 0.5]
+        self.Ki = [0.25, 0.35, 1.0, 0.05]
+        self.Kd = [3.0, 10.0, 34.0, 0.01]
 
-        # --- Derivative filters (initialize to 0.0 to avoid NoneType) ---
+        # --- Internal PID state ---
+        # [X, Y, Z, Yaw]
+        self.prev_error = [0.0, 0.0, 0.0, 0.0]
+        self.error_sum = [0.0, 0.0, 0.0, 0.0]
+        self.prev_output = [1500, 1500, 1500, 1500]
+
+        # --- Derivative filters ---
         self.diff_x = 0.0
         self.diff_y = 0.0
         self.diff_z = 0.0
+        self.diff_yaw = 0.0
 
         # --- RC Command ---
         self.cmd = SwiftMsgs()
         self.reset_rc()
 
         # --- RC limits ---
-        self.max_values = [2000, 2000, 2000]
-        self.min_values = [1000, 1000, 1000]
+        self.max_values = [2000, 2000, 2000, 2000]
+        self.min_values = [1000, 1000, 1000, 1000]
 
         # --- Control Timing ---
         self.sample_time = 0.03  # seconds
         self.last_time = self.get_clock().now().nanoseconds / 1e9
 
         # --- Fixed filter/smoothing constants ---
-        self.alpha = 0.35  # output smoothing (higher = smoother, slower)
-        self.beta = 0.90  # derivative low-pass filter (higher = smoother derivative)
-        self.integral_limit = 30.0
-        self.deadband = 0.10
+        self.alpha = 0.35
+        self.beta = 0.90  # Kept lower for fast X/Y response
+        self.integral_limit = 60.0
+        self.deadband = 0.20
 
         # --- Publishers ---
         self.command_pub = self.create_publisher(SwiftMsgs, '/drone_command', 10)
@@ -63,6 +75,7 @@ class Swift_Pico(Node):
 
         # --- Subscribers ---
         self.create_subscription(PoseArray, '/whycon/poses', self.whycon_callback, 1)
+        self.create_subscription(Odometry, '/rotors/odometry', self.odometry_callback, 1)
         self.create_subscription(PIDTune, '/throttle_pid', self.altitude_set_pid, 1)
         self.create_subscription(PIDTune, '/pitch_pid', self.pitch_set_pid, 1)
         self.create_subscription(PIDTune, '/roll_pid', self.roll_set_pid, 1)
@@ -76,7 +89,7 @@ class Swift_Pico(Node):
         self.create_timer(self.sample_time, self.pid)
         self.get_logger().info("🧭 Stable Swift Pico Controller started (fixed smoothing)")
 
-    # ---------------- Arm/Disarm ----------------
+    # ---------------- Arm/Disarm & State Update ----------------
     def updateDesiredState(self, msg: Vector3):
         self.desired_state = [msg.x, msg.y, msg.z]
 
@@ -99,7 +112,6 @@ class Swift_Pico(Node):
 
     # ---------------- PID tuning updates ----------------
     def altitude_set_pid(self, msg):
-        # note: Ki is scaled by your UI convention
         self.Kp[2] = msg.kp
         self.Ki[2] = msg.ki / 250
         self.Kd[2] = msg.kd
@@ -117,7 +129,22 @@ class Swift_Pico(Node):
         self.Kd[1] = msg.kd
         self.get_logger().info(f"Updated Roll PID: Kp={self.Kp[1]}, Ki={self.Ki[1]}, Kd={self.Kd[1]}")
 
-    # ---------------- Pose callback ----------------
+    # ---------------- Yaw Odometry Callback (DYNAMIC BASELINE) ----------------
+    def odometry_callback(self, msg: Odometry):
+        orientation_q = msg.pose.pose.orientation
+        orientation_list = [orientation_q.x, orientation_q.y, orientation_q.z, orientation_q.w]
+        (roll, pitch, yaw) = euler_from_quaternion(orientation_list)
+
+        self.current_yaw = yaw
+
+        # --- FIX: Capture initial yaw as the desired yaw only once ---
+        if not self.initial_yaw_set:
+            self.desired_yaw = self.current_yaw
+            self.initial_yaw_set = True
+            self.get_logger().info(f"Initial Yaw Baseline set to: {math.degrees(self.desired_yaw):.2f}°")
+        # -----------------------------------------------------------
+
+    # ---------------- Pose callback (WhyCon) ----------------
     def whycon_callback(self, msg: PoseArray):
         if msg.poses:
             pose = msg.poses[0].position
@@ -129,7 +156,6 @@ class Swift_Pico(Node):
         dt = max(self.sample_time, now - self.last_time)
         self.last_time = now
 
-        # helper to sanitize numeric values
         def safe_num(x, default=0.0):
             try:
                 if x is None:
@@ -140,12 +166,15 @@ class Swift_Pico(Node):
             except Exception:
                 return default
 
-        # PID compute function (robust against None/NaN diff_prev)
         def compute_pid(axis, desired, current, prev_err, err_sum, diff_prev):
             prev_err = safe_num(prev_err, 0.0)
             diff_prev = safe_num(diff_prev, 0.0)
 
             error = desired - current
+
+            # YAW WRAP-AROUND (Axis 3)
+            if axis == 3:
+                error = math.atan2(math.sin(error), math.cos(error))
 
             # Axis-specific deadbands
             if axis == 2 and abs(error) < 0.05:
@@ -153,12 +182,17 @@ class Swift_Pico(Node):
             elif abs(error) < self.deadband:
                 error = 0.0
 
+            # ----------------- TARGETED DERIVATIVE FILTER FIX -----------------
+            beta_effective = self.beta
+            if axis == 2:  # Z-axis (Throttle)
+                # Use a much higher beta to aggressively smooth noisy altitude derivative
+                beta_effective =  0.98  # ------------------------------------------------------------------
+
             # Derivative term (raw and filtered)
             diff_raw = (error - prev_err) / dt if dt > 0 else 0.0
-            diff_filtered = self.beta * diff_prev + (1.0 - self.beta) * diff_raw
+            diff_filtered = beta_effective * diff_prev + (1.0 - beta_effective) * diff_raw
 
-            # Integral handling (for axis 2 we may freeze externally)
-            # For normal axes, accumulation happens here
+            # Integral handling
             if axis != 2:
                 if abs(error) > self.deadband:
                     err_sum += error * dt
@@ -174,67 +208,69 @@ class Swift_Pico(Node):
                       self.Kd[axis] * diff_filtered)
             return float(output), float(error), float(err_sum), float(diff_filtered)
 
-        # --- Compute pitch (X) - normal
+        # --- Compute Pitch and Roll ---
         out_x, ex, self.error_sum[0], self.diff_x = compute_pid(
             0, self.desired_state[0], self.current_state[0],
             self.prev_error[0], self.error_sum[0],
             getattr(self, "diff_x", 0.0)
         )
 
-        # --- Compute roll (Y) - reversed logic kept (works for your frame)
         out_y, ey, self.error_sum[1], self.diff_y = compute_pid(
-            1, self.current_state[1], self.desired_state[1],  # intentional reversal kept
+            1, self.current_state[1], self.desired_state[1],
             self.prev_error[1], self.error_sum[1],
             getattr(self, "diff_y", 0.0)
         )
 
-        # --- Throttle (Z) adaptive handling (altitude same between waypoints case) ---
-        # Compute raw altitude error
+        # --- Compute Yaw (Conditional on baseline being set) ---
+        ez_yaw = 0.0
+        rc_yaw = 1500
+
+        if self.desired_yaw is not None:
+            out_yaw, ez_yaw, self.error_sum[3], self.diff_yaw = compute_pid(
+                3, self.desired_yaw, self.current_yaw,
+                self.prev_error[3], self.error_sum[3],
+                getattr(self, "diff_yaw", 0.0)
+            )
+            rc_yaw = 1500 + out_yaw
+        # -----------------------------------------------------
+
+        # --- Throttle (Z) adaptive handling ---
         z_err = self.desired_state[2] - self.current_state[2]
         altitude_error_abs = abs(z_err)
 
-        # Detect horizontal motion (proxy) and pitch activity to freeze throttle integral
         horiz_err = math.hypot(self.desired_state[0] - self.current_state[0],
                                self.desired_state[1] - self.current_state[1])
 
-        horizontal_motion_threshold = 0.15   # tune to your position noise level (m)
-        pitch_activity_threshold = 8.0       # tune depending on magnitude of out_x during translational pitch
+        horizontal_motion_threshold = 0.15
+        pitch_activity_threshold = 8.0
         pitch_activity = abs(out_x)
 
-        # Decide whether to allow throttle integral accumulation
         throttle_integrate = not (horiz_err > horizontal_motion_threshold or pitch_activity > pitch_activity_threshold)
 
-        # Temporarily compute throttle PID using current thr_err_sum, then update thr_err_sum based on throttle_integrate
         thr_err_sum = safe_num(self.error_sum[2], 0.0)
 
-        # First compute to get derivative and raw output (no integration done here for axis 2)
         out_z_tmp, ez_tmp, _, diff_z_tmp = compute_pid(
             2, self.desired_state[2], self.current_state[2],
             self.prev_error[2], thr_err_sum,
             getattr(self, "diff_z", 0.0)
         )
-        # Use the returned derivative for further logic
         self.diff_z = safe_num(diff_z_tmp, 0.0)
         ez = safe_num(ez_tmp, 0.0)
 
-        # Now integrate throttle error only if allowed and error significant
         if throttle_integrate and abs(ez) > 0.02:
             thr_err_sum += ez * dt
 
-        # clamp integral and store back
         thr_err_sum = max(-self.integral_limit, min(self.integral_limit, thr_err_sum))
         self.error_sum[2] = thr_err_sum
 
-        # Recompute final throttle output with updated integral
         out_z, ez, self.error_sum[2], self.diff_z = compute_pid(
             2, self.desired_state[2], self.current_state[2],
             self.prev_error[2], self.error_sum[2],
             getattr(self, "diff_z", 0.0)
         )
 
-        # Coupling compensation: small feedforward from pitch command to throttle
-        # Tune k_couple for your airframe (0.06..0.20). Sign assumes pitching forward increases thrust demand.
-        k_couple = 0.12
+        # Coupling compensation
+        k_couple = 0.08
         coupling_comp = k_couple * out_x
         out_z -= coupling_comp
 
@@ -242,23 +278,25 @@ class Swift_Pico(Node):
         rc_thr = 1500 - out_z
         rc_pitch = 1500 + out_x
         rc_roll = 1500 - out_y
+        # rc_yaw is already calculated above (conditionally)
 
-        # --- Output smoothing (heavier for throttle) ---
-        alpha_throttle = 0.5   # heavier smoothing for throttle to avoid hunting during translation
+        # --- Output smoothing ---
+        alpha_throttle = 0.5
         rc_thr = int(alpha_throttle * self.prev_output[2] + (1.0 - alpha_throttle) * rc_thr)
         rc_pitch = int(self.alpha * self.prev_output[0] + (1.0 - self.alpha) * rc_pitch)
         rc_roll = int(self.alpha * self.prev_output[1] + (1.0 - self.alpha) * rc_roll)
+        rc_yaw = int(self.alpha * self.prev_output[3] + (1.0 - self.alpha) * rc_yaw)
 
         # --- Clamp RC values ---
         self.cmd.rc_throttle = max(self.min_values[2], min(self.max_values[2], rc_thr))
         self.cmd.rc_pitch = max(self.min_values[0], min(self.max_values[0], rc_pitch))
         self.cmd.rc_roll = max(self.min_values[1], min(self.max_values[1], rc_roll))
-        self.cmd.rc_yaw = 1500
+        self.cmd.rc_yaw = max(self.min_values[3], min(self.max_values[3], rc_yaw))
 
         # publish command
         self.command_pub.publish(self.cmd)
 
-        # --- Stability detection (altitude stable at setpoint for ~3s) ---
+        # --- Stability detection ---
         if altitude_error_abs < 0.25 and abs(self.diff_z) < 0.04:
             self.stable_counter += 1
         else:
@@ -268,14 +306,18 @@ class Swift_Pico(Node):
             self.get_logger().info("✅ Altitude stable at waypoint (3s)")
 
         # --- Save for next loop ---
-        self.prev_error = [ex, ey, ez]
-        self.prev_output = [rc_pitch, rc_roll, rc_thr]
+        # Ensure we save the correct yaw output and error
+        yaw_error_to_save = ez_yaw
+        yaw_output_to_save = rc_yaw
+
+        self.prev_error = [ex, ey, ez, yaw_error_to_save]
+        self.prev_output = [rc_pitch, rc_roll, rc_thr, yaw_output_to_save]
 
         # Periodic log
         if int(now * 2) % 2 == 0:
             self.get_logger().info(
                 f"Herr:{horiz_err:.3f} Z:{self.current_state[2]:.3f}/{self.desired_state[2]:.3f} "
-                f"Thr:{self.cmd.rc_throttle} | Pit:{self.cmd.rc_pitch} | Rol:{self.cmd.rc_roll}"
+                f"Thr:{self.cmd.rc_throttle} | Pit:{self.cmd.rc_pitch} | Rol:{self.cmd.rc_roll} | Yaw:{self.cmd.rc_yaw}"
             )
 
 
