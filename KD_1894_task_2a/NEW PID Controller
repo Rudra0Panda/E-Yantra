@@ -35,9 +35,9 @@ class Swift_Pico(Node):
 
         # --- PID constants (FINAL CRITICALLY DAMPED GAINS) ---
         # [Pitch (X), Roll (Y), Throttle (Z), Yaw (Index 3)]
-        self.Kp = [8.0, 6.0, 16.0, 0.5]
-        self.Ki = [0.25, 0.35, 1.0, 0.05]
-        self.Kd = [3.0, 10.0, 34.0, 0.01]
+        self.Kp = [10.0, 8.0, 22.0, 0.5]
+        self.Ki = [0.30, 0.35, 5.0, 0.05]
+        self.Kd = [7.5, 12.0, 40.0, 0.01]
 
         # --- Internal PID state ---
         # [X, Y, Z, Yaw]
@@ -156,6 +156,8 @@ class Swift_Pico(Node):
         dt = max(self.sample_time, now - self.last_time)
         self.last_time = now
 
+        print(f"x:{prev}")
+
         def safe_num(x, default=0.0):
             try:
                 if x is None:
@@ -207,6 +209,9 @@ class Swift_Pico(Node):
                       self.Ki[axis] * err_sum +
                       self.Kd[axis] * diff_filtered)
             return float(output), float(error), float(err_sum), float(diff_filtered)
+
+
+
 
         # --- Compute Pitch and Roll ---
         out_x, ex, self.error_sum[0], self.diff_x = compute_pid(
@@ -281,7 +286,7 @@ class Swift_Pico(Node):
         # rc_yaw is already calculated above (conditionally)
 
         # --- Output smoothing ---
-        alpha_throttle = 0.5
+        alpha_throttle = 0.50
         rc_thr = int(alpha_throttle * self.prev_output[2] + (1.0 - alpha_throttle) * rc_thr)
         rc_pitch = int(self.alpha * self.prev_output[0] + (1.0 - self.alpha) * rc_pitch)
         rc_roll = int(self.alpha * self.prev_output[1] + (1.0 - self.alpha) * rc_roll)
