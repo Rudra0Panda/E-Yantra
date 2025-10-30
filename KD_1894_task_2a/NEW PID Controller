@@ -37,7 +37,7 @@ class Swift_Pico(Node):
         # [Pitch (X), Roll (Y), Throttle (Z), Yaw (Index 3)]
         self.Kp = [10.0, 8.0, 22.0, 0.5]
         self.Ki = [0.30, 0.35, 5.0, 0.05]
-        self.Kd = [7.5, 12.0, 40.0, 0.01]
+        self.Kd = [9.0, 12.0, 40.0, 0.01]
 
         # --- Internal PID state ---
         # [X, Y, Z, Yaw]
@@ -65,7 +65,7 @@ class Swift_Pico(Node):
 
         # --- Fixed filter/smoothing constants ---
         self.alpha = 0.35
-        self.beta = 0.90  # Kept lower for fast X/Y response
+        self.beta = 0.92  # Kept lower for fast X/Y response
         self.integral_limit = 60.0
         self.deadband = 0.20
 
@@ -186,7 +186,7 @@ class Swift_Pico(Node):
             beta_effective = self.beta
             if axis == 2:  # Z-axis (Throttle)
                 # Use a much higher beta to aggressively smooth noisy altitude derivative
-                beta_effective =  0.98  # ------------------------------------------------------------------
+                beta_effective = 0.98  # ------------------------------------------------------------------
 
             # Derivative term (raw and filtered)
             diff_raw = (error - prev_err) / dt if dt > 0 else 0.0
@@ -207,9 +207,6 @@ class Swift_Pico(Node):
                       self.Ki[axis] * err_sum +
                       self.Kd[axis] * diff_filtered)
             return float(output), float(error), float(err_sum), float(diff_filtered)
-
-            
-
 
         # --- Compute Pitch and Roll ---
         out_x, ex, self.error_sum[0], self.diff_x = compute_pid(
@@ -251,7 +248,7 @@ class Swift_Pico(Node):
         throttle_integrate = not (horiz_err > horizontal_motion_threshold or pitch_activity > pitch_activity_threshold)
 
         thr_err_sum = safe_num(self.error_sum[2], 0.0)
-        
+
         out_z_tmp, ez_tmp, _, diff_z_tmp = compute_pid(
             2, self.desired_state[2], self.current_state[2],
             self.prev_error[2], thr_err_sum,
@@ -284,7 +281,7 @@ class Swift_Pico(Node):
         # rc_yaw is already calculated above (conditionally)
 
         # --- Output smoothing ---
-        alpha_throttle = 0.50
+        alpha_throttle = 0.45
         rc_thr = int(alpha_throttle * self.prev_output[2] + (1.0 - alpha_throttle) * rc_thr)
         rc_pitch = int(self.alpha * self.prev_output[0] + (1.0 - self.alpha) * rc_pitch)
         rc_roll = int(self.alpha * self.prev_output[1] + (1.0 - self.alpha) * rc_roll)
