@@ -37,7 +37,7 @@ class Swift_Pico(Node):
         # [Pitch (X), Roll (Y), Throttle (Z), Yaw (Index 3)]
         self.Kp = [10.0, 8.0, 22.0, 0.5]
         self.Ki = [0.30, 0.35, 5.0, 0.05]
-        self.Kd = [9.0, 12.0, 40.0, 0.01]
+        self.Kd = [11.0, 14.0, 40.0, 0.01]
 
         # --- Internal PID state ---
         # [X, Y, Z, Yaw]
