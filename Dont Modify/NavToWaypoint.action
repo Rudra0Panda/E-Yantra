@@ -1,0 +1,8 @@
+# Request
+geometry_msgs/Pose waypoint
+---
+# Result
+int32 hover_time
+---
+# Feedback
+geometry_msgs/PoseStamped current_position
