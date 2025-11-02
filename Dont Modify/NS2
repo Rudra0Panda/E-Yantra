@@ -346,7 +346,7 @@ class WayPointServer(Node):
             rc_yaw = 1500 + out_yaw
 
         # --- Altitude PID ---
-        z_target = self.desired_state[2]
+        z_target = self.desired_state[2]-1.4
         z_err = z_target - self.current_state[2]
         if abs(z_err) < 0.05:
             z_err = 0.0
