@@ -19,29 +19,31 @@ class WayPointServer(Node):
     def __init__(self):
         super().__init__("waypoint_server")
 
-        # State variables (smoothed)
+        # State variables
+        self.cmd = SwiftMsgs()
         self.current_state = [0.0, 0.0, 0.0, 0.0]  # x, y, z, yaw
-        self.current_state_filtered = [0.0, 0.0, 0.0, 0.0]
         self.desired_state = [0.0, 0.0, 0.0, 0.0]
 
-        # PID gains (conservative starting values)
-        self.Kp = [7.0, 6.0, 14.5, 0.45]
-        self.Ki = [0.12, 0.12, 2.8, 0.02]
-        self.Kd = [6.0, 8.0, 36.0, 0.008]
+        # --- NEW: store current roll/pitch for thrust decoupling ---
+        self.current_roll = 0.0
+        self.current_pitch = 0.0
+
+        # PID gains
+        self.Kp = [10, 8, 16.0, 0.5]
+        self.Ki = [0.30, 0.35, 1, 0.05]
+        self.Kd = [11, 14, 32.0, 0.01]
 
         # PID states
         self.prev_error = [0.0, 0.0, 0.0, 0.0]
         self.error_sum = [0.0, 0.0, 0.0, 0.0]
-        # prev_output index order: [pitch, roll, throttle, yaw]
         self.prev_output = [1500, 1500, 1500, 1500]
 
-        # Other constants / filters
-        self.alpha_pose = 0.6  # smoothing factor for position/yaw updates (0-1, close to 1 = smoother)
-        # per-axis derivative smoothing (beta). Higher = heavier smoothing on derivative
-        self.beta_per_axis = [0.92, 0.92, 0.98, 0.9]
-        self.integral_limit = 40.0
-        self.deadband = 0.10  # tighten deadband slightly
-        self.sample_time = 0.03
+        # Other constants
+        self.alpha = 0.35
+        self.beta = 0.92
+        self.integral_limit = 60.0
+        self.deadband = 0.20
+        self.sample_time = 0.03  # 33.33 Hz
         self.last_time = self.get_clock().now().nanoseconds / 1e9
 
         # Drone state
@@ -53,6 +55,7 @@ class WayPointServer(Node):
         self.stable_counter = 0
         self.initial_yaw_set = False
         self.desired_yaw = None
+        self.holding = False  # <-- NEW: hover hold flag
 
         # Callback groups
         self.action_callback_group = ReentrantCallbackGroup()
@@ -84,8 +87,12 @@ class WayPointServer(Node):
 
         # Control loop
         self.control_timer = self.create_timer(self.sample_time, self.pid)
+        # Ensure dt matches timer period (stable derivative/integral)
+        self.fixed_dt = getattr(self.control_timer, "timer_period_ns", int(self.sample_time * 1e9)) * 1e-9
+        self._jitter_warned = False
+        self.last_tick_time = self.get_clock().now().nanoseconds * 1e-9
 
-        self.get_logger().info("🧭 Stable Swift Pico Controller started (improved stability)")
+        self.get_logger().info("🧭 Stable Swift Pico Controller started (fixed hover timing)")
 
         # Arm the drone
         self.arm()
@@ -108,35 +115,27 @@ class WayPointServer(Node):
         if not msg.poses:
             return
         p = msg.poses[0]
-        # low-pass filter the raw pose to reduce measurement noise before derivative calc
-        alpha = self.alpha_pose
-        self.current_state_filtered[0] = alpha * self.current_state_filtered[0] + (1 - alpha) * p.position.x
-        self.current_state_filtered[1] = alpha * self.current_state_filtered[1] + (1 - alpha) * p.position.y
-        self.current_state_filtered[2] = alpha * self.current_state_filtered[2] + (1 - alpha) * p.position.z
+        self.current_state[0] = p.position.x
+        self.current_state[1] = p.position.y
+
+        # --- NEW: smooth Z to reduce noise ---
+        z_raw = p.position.z
+        self.current_state[2] = 0.8 * self.current_state[2] + 0.2 * z_raw
 
         orientation_q = p.orientation
         _, _, yaw = euler_from_quaternion(
             [orientation_q.x, orientation_q.y, orientation_q.z, orientation_q.w]
         )
-        # wrap yaw and smooth
-        # convert to vectorized smooth using angle unwrap / wrap trick
-        prev_yaw = self.current_state_filtered[3]
-        # smooth using circular mean filter
-        x_prev, y_prev = math.cos(prev_yaw), math.sin(prev_yaw)
-        x_new, y_new = math.cos(yaw), math.sin(yaw)
-        x = alpha * x_prev + (1 - alpha) * x_new
-        y = alpha * y_prev + (1 - alpha) * y_new
-        smooth_yaw = math.atan2(y, x)
-        self.current_state_filtered[3] = smooth_yaw
-
-        # copy into current_state used by control (threading considered OK because single-threaded callbacks)
-        self.current_state = self.current_state_filtered.copy()
+        self.current_state[3] = yaw
 
     def odometry_callback(self, msg: Odometry):
         orientation_q = msg.pose.pose.orientation
-        _, _, yaw = euler_from_quaternion(
+        roll, pitch, yaw = euler_from_quaternion(
             [orientation_q.x, orientation_q.y, orientation_q.z, orientation_q.w]
         )
+        # --- NEW: keep attitude for thrust decoupling ---
+        self.current_roll = roll
+        self.current_pitch = pitch
 
         self.current_yaw = yaw
         if not self.initial_yaw_set:
@@ -168,14 +167,16 @@ class WayPointServer(Node):
         hover_start_time = None
         max_hover_time = 0.0
 
+        # --- NEW: hysteresis thresholds ---
+        enter_threshold = 0.4
+        exit_threshold = 0.55
+
         while rclpy.ok():
-            # Handle goal cancellation
             if goal_handle.is_cancel_requested:
                 goal_handle.canceled()
                 self.get_logger().info("Goal canceled by client.")
                 return result
 
-            # Publish feedback
             try:
                 feedback_msg.current_position.x = self.current_state[0]
                 feedback_msg.current_position.y = self.current_state[1]
@@ -184,11 +185,15 @@ class WayPointServer(Node):
             except Exception:
                 pass
 
-            # Check if drone is within tolerance radius (in meters)
-            in_sphere = self.is_drone_in_sphere(self.current_state, self.desired_state, 0.4)
+            # --- NEW: hysteresis logic for hover stability ---
+            if not self.holding:
+                in_sphere = self.is_drone_in_sphere(self.current_state, self.desired_state, enter_threshold)
+            else:
+                in_sphere = self.is_drone_in_sphere(self.current_state, self.desired_state, exit_threshold)
 
             if in_sphere:
-                if hover_start_time is None:
+                if not self.holding:
+                    self.holding = True
                     hover_start_time = self.get_clock().now().nanoseconds / 1e9
                     self.get_logger().info(" Drone entered hover sphere for the first time.")
                 else:
@@ -196,27 +201,35 @@ class WayPointServer(Node):
                     if hover_duration > max_hover_time:
                         max_hover_time = hover_duration
                     self.get_logger().info(f"Hovering... {hover_duration:.2f}s inside sphere.")
-                    # check if hovered for 3s continuously
                     if hover_duration >= 3.0:
                         total_time = (self.get_clock().now().nanoseconds / 1e9) - start_time
-                        result.hover_time = hover_duration
-                        self.get_logger().info(
-                            f" {hover_duration:.2f}s (Total time: {total_time:.2f}s).")
+                        result.hover_time = int(hover_duration)
+                        self.get_logger().info(f"✅ Stable hover for {hover_duration:.2f}s (Total {total_time:.2f}s).")
                         goal_handle.succeed()
                         return result
             else:
+                if self.holding:
+                    self.get_logger().info(" Drone exited hover sphere.")
+                self.holding = False
                 hover_start_time = None
 
-            # small sleep to yield CPU - keep this short
-            time.sleep(0.05)
+            time.sleep(0.1)
 
         return result
 
     # ------------------- PID LOOP -------------------
     def pid(self):
-        now = self.get_clock().now().nanoseconds / 1e9
-        dt = max(now - self.last_time, 1e-6)
-        self.last_time = now
+        now = self.get_clock().now().nanoseconds * 1e-9
+        dt_target = self.fixed_dt
+        dt_measured = now - self.last_tick_time if now >= self.last_tick_time else dt_target
+        self.last_tick_time = now
+
+        jitter = dt_measured - dt_target
+        if abs(jitter) > 0.5 * dt_target and not self._jitter_warned:
+            self.get_logger().warn(f"Control-loop jitter: {jitter:.4f}s (measured {dt_measured:.4f}s vs target {dt_target:.4f}s)")
+            self._jitter_warned = True
+
+        dt = dt_target
 
         def safe_num(x, default=0.0):
             try:
@@ -232,51 +245,36 @@ class WayPointServer(Node):
             prev_err = safe_num(prev_err, 0.0)
             diff_prev = safe_num(diff_prev, 0.0)
 
-            # compute error, with angle wrap for yaw
             error = desired - current
             if axis == 3:
                 error = math.atan2(math.sin(error), math.cos(error))
 
-            # Axis-specific deadbands
-            if axis == 2 and abs(error) < 0.05:
+            if axis == 2 and abs(error) < 0.03:
                 error = 0.0
-            elif axis != 2 and abs(error) < self.deadband:
+            elif abs(error) < self.deadband:
                 error = 0.0
 
-            # derivative with axis-specific smoothing
-            beta_effective = self.beta_per_axis[axis]
+            beta_effective = self.beta
+            if axis == 2:
+                beta_effective = 0.98
+
             diff_raw = (error - prev_err) / dt if dt > 0 else 0.0
             diff_filtered = beta_effective * diff_prev + (1.0 - beta_effective) * diff_raw
 
-            # integrate conditionally: don't integrate when large motion or saturated
-            integrate_allowed = True
-            # for horizontal axes we avoid integrating during large horizontal error
-            if axis in (0, 1):
-                if abs(error) > 1.0:  # if very far, don't accumulate integral
-                    integrate_allowed = False
+            if axis != 2:
+                if abs(error) > self.deadband:
+                    err_sum += error * dt
 
-            if axis == 2:
-                # for throttle integration allow less aggressive integration
-                if abs(error) < 0.5:
-                    integrate_allowed = True
-                else:
-                    integrate_allowed = False
-
-            if integrate_allowed:
-                err_sum += error * dt
-
-            # clamp integrator
             if not math.isfinite(err_sum):
                 err_sum = 0.0
             err_sum = max(-self.integral_limit, min(self.integral_limit, err_sum))
 
-            # PID formula
             output = (self.Kp[axis] * error +
                       self.Ki[axis] * err_sum +
                       self.Kd[axis] * diff_filtered)
             return float(output), float(error), float(err_sum), float(diff_filtered)
 
-        # --- Compute Pitch and Roll (note: desired before current) ---
+        # --- Pitch and Roll ---
         out_x, ex, self.error_sum[0], self.diff_x = compute_pid(
             0, self.desired_state[0], self.current_state[0],
             self.prev_error[0], self.error_sum[0],
@@ -284,16 +282,14 @@ class WayPointServer(Node):
         )
 
         out_y, ey, self.error_sum[1], self.diff_y = compute_pid(
-            1, self.current_state[1],self.desired_state[1],
+            1, self.current_state[1], self.desired_state[1],
             self.prev_error[1], self.error_sum[1],
             getattr(self, "diff_y", 0.0)
         )
 
-        # --- Compute Yaw (Conditional on baseline being set) ---
         ez_yaw = 0.0
         rc_yaw = 1500
-
-        if self.desired_yaw is not None and hasattr(self, "current_yaw"):
+        if self.desired_yaw is not None:
             out_yaw, ez_yaw, self.error_sum[3], self.diff_yaw = compute_pid(
                 3, self.desired_yaw, self.current_yaw,
                 self.prev_error[3], self.error_sum[3],
@@ -301,7 +297,6 @@ class WayPointServer(Node):
             )
             rc_yaw = 1500 + out_yaw
 
-        # --- Throttle (Z) adaptive handling ---
         z_err = self.desired_state[2] - self.current_state[2]
         altitude_error_abs = abs(z_err)
 
@@ -336,34 +331,28 @@ class WayPointServer(Node):
             getattr(self, "diff_z", 0.0)
         )
 
-        # Coupling compensation (softened)
-        k_couple = 0.05
-        coupling_comp = k_couple * out_x
-        out_z -= coupling_comp
+        base_throttle = 1500 - out_z
 
-        # --- RC mapping (signs preserved as original design) ---
-        rc_thr = 1500 - out_z
+        cos_term = math.cos(self.current_pitch) * math.cos(self.current_roll)
+        comp = 1.0 / max(0.5, min(1.0, cos_term))
+        rc_thr = base_throttle * comp
+
         rc_pitch = 1500 + out_x
         rc_roll = 1500 - out_y
-        # rc_yaw already set if desired_yaw available
 
-        # --- Output smoothing (per-axis alpha) ---
         alpha_throttle = 0.45
         rc_thr = int(alpha_throttle * self.prev_output[2] + (1.0 - alpha_throttle) * rc_thr)
-        rc_pitch = int(self.alpha_pose * self.prev_output[0] + (1.0 - self.alpha_pose) * rc_pitch)
-        rc_roll = int(self.alpha_pose * self.prev_output[1] + (1.0 - self.alpha_pose) * rc_roll)
-        rc_yaw = int(self.alpha_pose * self.prev_output[3] + (1.0 - self.alpha_pose) * rc_yaw)
+        rc_pitch = int(self.alpha * self.prev_output[0] + (1.0 - self.alpha) * rc_pitch)
+        rc_roll = int(self.alpha * self.prev_output[1] + (1.0 - self.alpha) * rc_roll)
+        rc_yaw = int(self.alpha * self.prev_output[3] + (1.0 - self.alpha) * rc_yaw)
 
-        # --- Clamp RC values ---
         self.cmd.rc_throttle = max(self.min_values[2], min(self.max_values[2], rc_thr))
         self.cmd.rc_pitch = max(self.min_values[0], min(self.max_values[0], rc_pitch))
         self.cmd.rc_roll = max(self.min_values[1], min(self.max_values[1], rc_roll))
         self.cmd.rc_yaw = max(self.min_values[3], min(self.max_values[3], rc_yaw))
 
-        # publish command
         self.command_pub.publish(self.cmd)
 
-        # --- Stability detection ---
         if altitude_error_abs < 0.25 and abs(self.diff_z) < 0.04:
             self.stable_counter += 1
         else:
@@ -372,15 +361,9 @@ class WayPointServer(Node):
         if self.stable_counter > int(3.0 / max(self.sample_time, 0.01)):
             self.get_logger().info("✅ Altitude stable at waypoint (3s)")
 
-        # --- Save for next loop (correct ordering) ---
-        yaw_error_to_save = ez_yaw
-        yaw_output_to_save = rc_yaw
+        self.prev_error = [ex, ey, ez, ez_yaw]
+        self.prev_output = [rc_pitch, rc_roll, rc_thr, rc_yaw]
 
-        self.prev_error = [ex, ey, ez, yaw_error_to_save]
-        self.prev_output = [rc_pitch, rc_roll, rc_thr, yaw_output_to_save]
-
-
-    # ------------------- UTILITY -------------------
     def is_drone_in_sphere(self, drone_pos, goal_pos, radius):
         dx = drone_pos[0] - goal_pos[0]
         dy = drone_pos[1] - goal_pos[1]
