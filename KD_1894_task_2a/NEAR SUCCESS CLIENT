@@ -87,7 +87,7 @@ class WayPointClient(Node):
 
     def get_result_callback(self, future):
         result = future.result().result
-        self.get_logger().info(f'Result: Hover time = {result.hov_time:.2f}s')
+        self.get_logger().info(f'Result: Hover time = {int(result.hover_time):.2f}s')
 
         self.goal_index += 1
         if self.goal_index < len(self.goals):
