@@ -1,0 +1,300 @@
+#!/usr/bin/env python3
+import time
+import math
+import rclpy
+from rclpy.node import Node
+from rclpy.action import ActionServer
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
+
+from waypoint_navigation.action import NavToWaypoint
+from swift_msgs.msg import SwiftMsgs
+from geometry_msgs.msg import PoseArray, Pose
+from nav_msgs.msg import Odometry
+from std_msgs.msg import String
+from sensor_msgs.msg import Image
+from cv_bridge import CvBridge
+from tf_transformations import euler_from_quaternion
+
+import cv2
+import numpy as np
+
+# ---------------------------------------------------------------------
+# 🧠 HSV range for yellow-ish infected regions
+HSV_YELLOW_RANGE = (np.array([20, 50, 100]), np.array([35, 255, 255]))
+# ---------------------------------------------------------------------
+
+
+class WayPointServerVision(Node):
+    def __init__(self):
+        super().__init__("waypoint_server_task2b_vision")
+
+        # ------------- State variables -------------
+        self.cmd = SwiftMsgs()
+        self.current_state = [0.0, 0.0, 0.0, 0.0]
+        self.desired_state = [0.0, 0.0, 29.22, 0.0]
+        self.current_yaw = 0.0
+
+        # ------------- PID tuning -------------
+        self.Kp = [10, 8, 9.5, 0.5]
+        self.Ki = [0.30, 0.35, 0.4, 0.05]
+        self.Kd = [11, 14, 19, 0.01]
+        self.sample_time = 0.05
+        self.deadband = 0.15
+        self.deadband_z = 0.05
+        self.integral_limit = 40.0
+        self.alpha_cmd = 0.35
+        self.alpha_thr = 0.65
+        self.beta = 0.92
+        self.beta_z = 0.98
+        self.prev_error = [0.0]*4
+        self.error_sum = [0.0]*4
+        self.diff_prev = [0.0]*4
+        self.prev_output = [1500]*4
+        self.max_values = [2000]*4
+        self.min_values = [1000]*4
+        self.desired_yaw = None
+        self.initial_yaw_set = False
+        self.stable_counter = 0
+
+        # ------------- ROS Interfaces -------------
+        self.command_pub = self.create_publisher(SwiftMsgs, "/drone_command", 10)
+        self.pos_error_pub = self.create_publisher(String, "/infected_plant_detected", 10)
+
+        self.whycon_sub = self.create_subscription(PoseArray, "/whycon/poses", self.whycon_callback, 10)
+        self.odom_sub = self.create_subscription(Odometry, "/rotors/odometry", self.odometry_callback, 10)
+
+        # --- New: Subscribe to /whycon/image_out for infection detection ---
+        self.image_sub = self.create_subscription(Image, "/whycon/image_out", self.image_callback, 10)
+        self.bridge = CvBridge()
+        self.last_detected = {"block1": "N/A", "block2": "N/A"}
+
+        # --- Action server for navigation ---
+        self._action_server = ActionServer(
+            self, NavToWaypoint, "waypoint_navigation",
+            execute_callback=self.execute_callback,
+            callback_group=ReentrantCallbackGroup()
+        )
+
+        # PID timer
+        self.create_timer(self.sample_time, self.pid)
+
+        self.get_logger().info("🧭 Swift Pico Drone Server (Task 2B + Vision) started.")
+        self.arm()
+
+    # ---------------------------------------------------------------------
+    # 🟢 ARM/DISARM
+    # ---------------------------------------------------------------------
+    def arm(self):
+        self.cmd.rc_roll = self.cmd.rc_pitch = self.cmd.rc_yaw = self.cmd.rc_throttle = 1500
+        self.cmd.rc_aux4 = 2000
+        self.command_pub.publish(self.cmd)
+        self.get_logger().info("✅ Drone armed")
+
+    def disarm(self):
+        self.cmd.rc_roll = self.cmd.rc_pitch = self.cmd.rc_yaw = self.cmd.rc_throttle = 1000
+        self.cmd.rc_aux4 = 1000
+        self.command_pub.publish(self.cmd)
+        self.get_logger().info("🛑 Drone disarmed")
+
+    # ---------------------------------------------------------------------
+    # 🧩 WhyCon & Odometry Callbacks
+    # ---------------------------------------------------------------------
+    def whycon_callback(self, msg: PoseArray):
+        if not msg.poses:
+            return
+        p = msg.poses[0]
+        self.current_state[0] = p.position.x
+        self.current_state[1] = p.position.y
+        self.current_state[2] = p.position.z
+        q = p.orientation
+        _, _, yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])
+        self.current_state[3] = yaw
+
+    def odometry_callback(self, msg: Odometry):
+        q = msg.pose.pose.orientation
+        _, _, yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])
+        self.current_yaw = yaw
+        if not self.initial_yaw_set:
+            self.desired_yaw = yaw
+            self.initial_yaw_set = True
+            self.get_logger().info("Yaw baseline set")
+
+    # ---------------------------------------------------------------------
+    # 📷 Image Callback → Infection Detection
+    # ---------------------------------------------------------------------
+    def image_callback(self, msg: Image):
+        try:
+            frame = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+        except Exception as e:
+            self.get_logger().warn(f"Image conversion failed: {e}")
+            return
+
+        h, w, _ = frame.shape
+        mid_y, mid_x = h // 2, w // 2
+        block1 = frame[:mid_y, :mid_x]
+        block2 = frame[:mid_y, mid_x:]
+
+        def detect_region(region, prefix):
+            hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
+            mask = cv2.inRange(hsv, HSV_YELLOW_RANGE[0], HSV_YELLOW_RANGE[1])
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if not contours:
+                return f"{prefix}?"
+            areas = [cv2.contourArea(c) for c in contours]
+            return f"{prefix}{chr(65 + int(np.argmax(areas) % 6))}"  # crude label guess
+
+        p1 = detect_region(block1, "P1")
+        p2 = detect_region(block2, "P2")
+
+        if p1 != self.last_detected["block1"] or p2 != self.last_detected["block2"]:
+            self.last_detected.update({"block1": p1, "block2": p2})
+            msg_out = String()
+            msg_out.data = f"🦠 Detected infected plants → {p1}, {p2}"
+            self.pos_error_pub.publish(msg_out)
+            self.get_logger().info(msg_out.data)
+
+    # ---------------------------------------------------------------------
+    # 🧭 Action Execution (Waypoint Navigation)
+    # ---------------------------------------------------------------------
+    def execute_callback(self, goal_handle):
+        goal_pose = goal_handle.request.waypoint
+        self.desired_state[0] = goal_pose.position.x
+        self.desired_state[1] = goal_pose.position.y
+        self.desired_state[2] = goal_pose.position.z
+
+        q = goal_pose.orientation
+        _, _, self.desired_state[3] = euler_from_quaternion([q.x, q.y, q.z, q.w])
+
+        z_target = self.desired_state[2]
+        if z_target > 32:
+            stage = "PICKUP"
+        elif 28.5 <= z_target <= 31.0:
+            stage = "SPRAY"
+        else:
+            stage = "NAV"
+
+        self.get_logger().info(f"🎯 Waypoint → {self.desired_state} | Stage: {stage}")
+
+        feedback = NavToWaypoint.Feedback()
+        result = NavToWaypoint.Result()
+        hover_start = None
+
+        while rclpy.ok():
+            if goal_handle.is_cancel_requested:
+                goal_handle.canceled()
+                return result
+
+            feedback.current_position.x = self.current_state[0]
+            feedback.current_position.y = self.current_state[1]
+            feedback.current_position.z = self.current_state[2]
+            goal_handle.publish_feedback(feedback)
+
+            dist = math.sqrt(
+                (self.desired_state[0]-self.current_state[0])**2 +
+                (self.desired_state[1]-self.current_state[1])**2 +
+                (self.desired_state[2]-self.current_state[2])**2
+            )
+
+            if dist < 0.4:
+                if hover_start is None:
+                    hover_start = time.time()
+                elif time.time() - hover_start > (2.0 if stage != "NAV" else 3.0):
+                    self.get_logger().info(f"✅ {stage} complete ({time.time()-hover_start:.1f}s)")
+                    result.hover_time = int(time.time() - hover_start)
+                    goal_handle.succeed()
+                    return result
+            else:
+                hover_start = None
+
+            time.sleep(0.1)
+
+    # ---------------------------------------------------------------------
+    # ⚙️ PID Loop
+    # ---------------------------------------------------------------------
+    def pid(self):
+        def clamp(v, lo, hi): return max(lo, min(v, hi))
+
+        def compute(axis, tgt, val, pe, I, d_prev, beta, db):
+            e = tgt - val
+            if axis == 3:
+                e = math.atan2(math.sin(e), math.cos(e))
+            if abs(e) < db:
+                e = 0.0
+            I += e * self.sample_time
+            I = clamp(I, -self.integral_limit, self.integral_limit)
+            d_raw = (e - pe) / self.sample_time
+            d = beta * d_prev + (1 - beta) * d_raw
+            out = self.Kp[axis]*e + self.Ki[axis]*I + self.Kd[axis]*d
+            return out, e, I, d
+
+        out_x, ex, self.error_sum[0], self.diff_prev[0] = compute(
+            0, self.desired_state[0], self.current_state[0],
+            self.prev_error[0], self.error_sum[0], self.diff_prev[0],
+            self.beta, self.deadband
+        )
+        out_y, ey, self.error_sum[1], self.diff_prev[1] = compute(
+            1, self.current_state[1], self.desired_state[1],
+            self.prev_error[1], self.error_sum[1], self.diff_prev[1],
+            self.beta, self.deadband
+        )
+        rc_yaw = 1500
+        if self.desired_yaw is not None:
+            out_yaw, eyaw, self.error_sum[3], self.diff_prev[3] = compute(
+                3, self.desired_yaw, self.current_yaw,
+                self.prev_error[3], self.error_sum[3], self.diff_prev[3],
+                self.beta, self.deadband
+            )
+            rc_yaw = 1500 + out_yaw
+        else:
+            eyaw = 0.0
+        out_z, ez, self.error_sum[2], self.diff_prev[2] = compute(
+            2, self.desired_state[2], self.current_state[2],
+            self.prev_error[2], self.error_sum[2], self.diff_prev[2],
+            self.beta_z, self.deadband_z
+        )
+
+        rc_thr = 1500 - out_z
+        rc_pitch = 1500 + out_x
+        rc_roll = 1500 - out_y
+
+        rc_thr = int(self.alpha_thr*self.prev_output[2] + (1-self.alpha_thr)*rc_thr)
+        rc_pitch = int(self.alpha_cmd*self.prev_output[0] + (1-self.alpha_cmd)*rc_pitch)
+        rc_roll  = int(self.alpha_cmd*self.prev_output[1] + (1-self.alpha_cmd)*rc_roll)
+        rc_yaw   = int(self.alpha_cmd*self.prev_output[3] + (1-self.alpha_cmd)*rc_yaw)
+
+        self.cmd.rc_throttle = clamp(rc_thr, self.min_values[2], self.max_values[2])
+        self.cmd.rc_pitch = clamp(rc_pitch, self.min_values[0], self.max_values[0])
+        self.cmd.rc_roll = clamp(rc_roll, self.min_values[1], self.max_values[1])
+        self.cmd.rc_yaw = clamp(rc_yaw, self.min_values[3], self.max_values[3])
+        self.command_pub.publish(self.cmd)
+
+        if abs(self.desired_state[2]-self.current_state[2]) < 0.4:
+            self.stable_counter += 1
+        else:
+            self.stable_counter = 0
+        if self.stable_counter > int(3.0/self.sample_time):
+            self.get_logger().info("✅ Altitude stable")
+
+        self.prev_error = [ex, ey, ez, eyaw]
+        self.prev_output = [rc_pitch, rc_roll, rc_thr, rc_yaw]
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = WayPointServerVision()
+    executor = MultiThreadedExecutor(num_threads=3)
+    executor.add_node(node)
+    try:
+        executor.spin()
+    except KeyboardInterrupt:
+        node.get_logger().info("KeyboardInterrupt – shutting down.")
+    finally:
+        node.disarm()
+        executor.shutdown()
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
