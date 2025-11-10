@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+import rclpy
+from rclpy.node import Node
+from geometry_msgs.msg import Pose
+from std_msgs.msg import String
+from waypoint_navigation.srv import GetWaypoints
+
+
+class WaypointsVisionService(Node):
+    def __init__(self):
+        super().__init__('waypoints_service_task2b_vision')
+
+        # ---- Create the service ----
+        self.srv = self.create_service(GetWaypoints, 'waypoints', self.waypoint_callback)
+        self.get_logger().info("🧭 Vision-based Waypoint Service started.")
+
+        # ---- Subscribe to infected plant updates from server ----
+        self.infected_block1 = "P1A"
+        self.infected_block2 = "P2A"
+        self.create_subscription(String, "/infected_plant_detected", self.infection_callback, 10)
+
+        # ---- Mission coordinates (same as before) ----
+        self.coords = {
+            "ground_station": [-6.9, 0.09, 32.16],
+            "pesticide_station_1_pickup": [-9.07, 9.23, 32.57],
+            "pesticide_station_2_pickup": [-8.53, -8.52, 30.64],
+            "hula_hoop_1_entry": [-3.26, -8.12, 29.48],
+            "hula_hoop_1_exit": [0.8, -8.04, 29.20],
+            "hula_hoop_2_entry": [-3.26, 8.41, 29.88],
+            "hula_hoop_2_exit": [0.87, 8.18, 29.05],
+            "block_1": [6.60, 6.62, 30.20],
+            "block_2": [7.15, -7.00, 31.98],
+        }
+
+        self.plants = {
+            "P1A_hover": [4.39, 8.98, 29.29], "P1A_apply": [4.5, 8.88, 30.59],
+            "P1B_hover": [6.45, 8.79, 28.67], "P1B_apply": [6.85, 8.89, 30.62],
+            "P1C_hover": [8.62, 8.80, 28.69], "P1C_apply": [9.13, 8.80, 30.40],
+            "P1D_hover": [4.37, 4.57, 29.19], "P1D_apply": [4.53, 4.57, 30.79],
+            "P1E_hover": [6.76, 4.49, 28.77], "P1E_apply": [6.45, 4.57, 30.79],
+            "P1F_hover": [8.7, 4.53, 28.97],  "P1F_apply": [9.1, 4.53, 28.97],
+            "P2A_hover": [4.43, -4.30, 29.74], "P2A_apply": [4.43, -4.30, 31.1],
+            "P2B_hover": [6.68, -4.30, 29.74], "P2B_apply": [7.05, -4.30, 31.52],
+            "P2C_hover": [8.93, -4.30, 29.74], "P2C_apply": [9.32, -4.30, 31.06],
+            "P2D_hover": [4.58, -8.78, 30.62], "P2D_apply": [4.53, -8.59, 30.76],
+            "P2E_hover": [6.76, -8.61, 30.03], "P2E_apply": [7.05, -8.81, 31.52],
+            "P2F_hover": [9.17, -8.61, 30.03], "P2F_apply": [9.08, -8.92, 31.93],
+        }
+
+    # ------------------------------------------------------------------
+    def infection_callback(self, msg: String):
+        """Parses infected plant message from /infected_plant_detected."""
+        data = msg.data
+        # Expected format: "🦠 Detected infected plants → P1C, P2E"
+        try:
+            parts = data.split("→")[-1].strip().replace(" ", "").split(",")
+            self.infected_block1 = parts[0]
+            self.infected_block2 = parts[1]
+            self.get_logger().info(f"🌿 Updated infected plants: {self.infected_block1}, {self.infected_block2}")
+        except Exception as e:
+            self.get_logger().warn(f"Failed to parse infection update: {e}")
+
+    # ------------------------------------------------------------------
+    def waypoint_callback(self, request, response):
+        if not request.get_waypoints:
+            self.get_logger().warn("Waypoint request flag not set.")
+            return response
+
+        waypoints = []
+        # Mission structure identical to previous static plan
+        waypoints.append(self.coords["ground_station"])
+        waypoints.append(self.coords["pesticide_station_1_pickup"])
+        waypoints.append(self.coords["hula_hoop_2_entry"])
+        waypoints.append(self.coords["hula_hoop_2_exit"])
+
+        # Infected plant Block 1
+        if f"{self.infected_block1}_hover" in self.plants:
+            waypoints.append(self.plants[f"{self.infected_block1}_hover"])
+            waypoints.append(self.plants[f"{self.infected_block1}_apply"])
+
+        # Move to Block 2 and spray second plant
+        waypoints.append(self.coords["block_2"])
+        if f"{self.infected_block2}_hover" in self.plants:
+            waypoints.append(self.plants[f"{self.infected_block2}_hover"])
+            waypoints.append(self.plants[f"{self.infected_block2}_apply"])
+
+        # Return path
+        waypoints.append(self.coords["pesticide_station_2_pickup"])
+        waypoints.append(self.coords["hula_hoop_1_entry"])
+        waypoints.append(self.coords["hula_hoop_1_exit"])
+        waypoints.append(self.coords["ground_station"])
+
+        response.waypoints.poses = [Pose() for _ in range(len(waypoints))]
+        for i, (x, y, z) in enumerate(waypoints):
+            response.waypoints.poses[i].position.x = x
+            response.waypoints.poses[i].position.y = y
+            response.waypoints.poses[i].position.z = z
+
+        self.get_logger().info(
+            f"✅ Sent dynamic waypoints using infected plants {self.infected_block1}, {self.infected_block2}"
+        )
+        return response
+
+
+def main():
+    rclpy.init()
+    node = WaypointsVisionService()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        node.get_logger().info("🛑 Waypoint service stopped.")
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
