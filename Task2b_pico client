@@ -15,11 +15,13 @@ class WaypointClientVision(Node):
         self.action_client = ActionClient(self, NavToWaypoint, 'waypoint_navigation')
         self.service_client = self.create_client(GetWaypoints, 'waypoints')
         self.req = GetWaypoints.Request()
+        self.req.get_waypoints = True  # ✅ Critical fix: request actual waypoints
         self.goals = []
         self.goal_index = 0
 
         self.desired_pub = self.create_publisher(Vector3, '/desired_state', 10)
 
+        # Wait for service
         while not self.service_client.wait_for_service(timeout_sec=1.0):
             self.get_logger().info("⏳ Waiting for waypoint service...")
 
@@ -29,12 +31,18 @@ class WaypointClientVision(Node):
         future = self.service_client.call_async(self.req)
         rclpy.spin_until_future_complete(self, future)
         resp = future.result()
-        if not resp:
-            self.get_logger().error("❌ Failed to get waypoints.")
+
+        if not resp or not resp.waypoints.poses:
+            self.get_logger().error("❌ Failed to get valid waypoints from service.")
             return
+
         for pose in resp.waypoints.poses:
             self.goals.append([pose.position.x, pose.position.y, pose.position.z])
-        self.get_logger().info(f"✅ Received {len(self.goals)} waypoints.")
+
+        self.get_logger().info(f"✅ Received {len(self.goals)} waypoints from service.")
+        for i, g in enumerate(self.goals):
+            self.get_logger().info(f"   WP{i+1}: {g}")
+
         if self.goals:
             self.send_goal(self.goals[0])
 
