@@ -46,7 +46,6 @@ class WayPointServer(Node):
         self.cmd.rc_yaw = 1500
         self.cmd.rc_throttle = 1400
 
-        # Initiate or declare other variables here depending upon whether you are implementing PID or LQR controller.
         self.current_state = [0.0, 0.0, 0.0]  # x, y, z
         self.desired_state = [0.0, 0.0, 0.0]
 
@@ -57,9 +56,9 @@ class WayPointServer(Node):
         self.ma_z = deque(maxlen=self.ma_window)
         # -----------------------------------
 
-        self.Kp = [10, 8, 16]
-        self.Ki = [0.0000000030, 0.0000000035, 0.0000000001]
-        self.Kd = [11, 14, 38]
+        self.Kp = [3, 5, 12]
+        self.Ki = [0.0000000030, 0.0000000035, 0.0025]
+        self.Kd = [1, 3, 20]
 
         self.prev_error = [0.0, 0.0, 0.0]
         self.error_sum = [0.0, 0.0, 0.0]
@@ -70,7 +69,7 @@ class WayPointServer(Node):
         self.integral_limit = 60.0
         self.deadband = 1
 
-        self.sample_time = 0.00866  # ~115 Hz control loop
+        self.sample_time = 0.00866
         self.last_time = self.get_clock().now().nanoseconds / 1e9
 
         self.diff_x = self.diff_y = self.diff_z = self.diff_yaw = 0.0
@@ -82,16 +81,13 @@ class WayPointServer(Node):
 
         self.create_subscription(PoseArray, "/whycon/poses", self.whycon_callback, 1)
         self.odometry_subscription = self.create_subscription(
-            Odometry,
-            "/rotors/odometry",
-            self.odometry_callback,
-            10,
+            Odometry, "/rotors/odometry", self.odometry_callback, 10,
             callback_group=self.odometry_callback_group,
         )
 
         self.movingAvgPublisher = self.create_publisher(Vector3, "/moving_average/pose", 10)
 
-        # create an action server for NavToWaypoint.
+        # Action server
         self._action_server = ActionServer(
             self,
             NavToWaypoint,
@@ -123,7 +119,6 @@ class WayPointServer(Node):
         self.cmd.rc_aux4 = 2000
         self.command_pub.publish(self.cmd)
 
-    # Whycon callback
     def whycon_callback(self, msg):
 
         if not msg.poses or len(msg.poses) == 0:
@@ -132,7 +127,7 @@ class WayPointServer(Node):
 
         p = msg.poses[0]
 
-        # Raw moving average
+        # MOVING AVERAGE
         self.ma_x.append(p.position.x)
         self.ma_y.append(p.position.y)
         self.ma_z.append(p.position.z)
@@ -141,19 +136,16 @@ class WayPointServer(Node):
         filtered_y = sum(self.ma_y) / len(self.ma_y)
         filtered_z = sum(self.ma_z) / len(self.ma_z)
 
-        # Low-pass filter
         alpha = 0.2
         self.current_state[0] = alpha * filtered_x + (1 - alpha) * self.current_state[0]
         self.current_state[1] = alpha * filtered_y + (1 - alpha) * self.current_state[1]
         self.current_state[2] = alpha * filtered_z + (1 - alpha) * self.current_state[2]
 
-        self.movingAvgPublisher.publish(
-            Vector3(
-                x=self.current_state[0],
-                y=self.current_state[1],
-                z=self.current_state[2],
-            )
-        )
+        self.movingAvgPublisher.publish(Vector3(
+            x=self.current_state[0],
+            y=self.current_state[1],
+            z=self.current_state[2],
+        ))
 
         orientation_q = p.orientation
         _, _, yaw = euler_from_quaternion(
@@ -162,24 +154,19 @@ class WayPointServer(Node):
         self.yaw = yaw
 
         try:
-            sec = msg.header.stamp.sec
-            nanosec = msg.header.stamp.nanosec
-            self.dtime = float(sec) + float(nanosec) / 1e9
+            self.dtime = msg.header.stamp.sec + msg.header.stamp.nanosec / 1e9
         except:
             self.dtime = self.get_clock().now().nanoseconds / 1e9
 
-    # Odometry callback
     def odometry_callback(self, msg):
         orientation_q = msg.pose.pose.orientation
         roll, pitch, yaw = euler_from_quaternion(
             [orientation_q.x, orientation_q.y, orientation_q.z, orientation_q.w]
         )
-
         self.roll_deg = math.degrees(roll)
         self.pitch_deg = math.degrees(pitch)
         self.yaw_deg = math.degrees(yaw)
 
-    # MAIN PID LOOP
     def pid(self):
 
         now = self.get_clock().now().nanoseconds / 1e9
@@ -202,40 +189,24 @@ class WayPointServer(Node):
 
             return output, error, error_sum, diff
 
-        # Z PID
         throttle_output, self.prev_error[2], self.error_sum[2], self.diff_z = compute_pid(
-            2,
-            self.desired_state[2] - 1,
-            self.current_state[2],
-            self.prev_error[2],
-            self.error_sum[2],
-            self.diff_z,
+            2, self.desired_state[2] - 1, self.current_state[2],
+            self.prev_error[2], self.error_sum[2], self.diff_z
         )
 
-        # Y PID
-        pitch_output, self.prev_error[1], self.error_sum[1], self.diff_y = compute_pid(
-            1,
-            self.desired_state[1],
-            self.current_state[1],
-            self.prev_error[1],
-            self.error_sum[1],
-            self.diff_y,
+        pitch_output, self.prev_error[0], self.error_sum[0], self.diff_y = compute_pid(
+            0,self.desired_state[0],self.current_state[0],
+            self.prev_error[0], self.error_sum[0], self.diff_y
         )
 
-        # X PID
-        roll_output, self.prev_error[0], self.error_sum[0], self.diff_x = compute_pid(
-            0,
-            self.desired_state[0],
-            self.current_state[0],
-            self.prev_error[0],
-            self.error_sum[0],
-            self.diff_x,
+        roll_output, self.prev_error[1], self.error_sum[1], self.diff_x = compute_pid(
+            1,self.current_state[1],self.desired_state[1],
+            self.prev_error[1], self.error_sum[1], self.diff_x
         )
 
-        # RC mapping
         rc_throttle = int(1532 - throttle_output)
 
-        if 1527 <= rc_throttle and 1532 >= rc_throttle:
+        if 1527 <= rc_throttle <= 1532:
             rc_throttle = 1532
         if rc_throttle < 1528:
             rc_throttle = 1500 - throttle_output
@@ -243,12 +214,12 @@ class WayPointServer(Node):
         rc_throttle = max(1450, min(1650, rc_throttle))
 
         self.cmd.rc_throttle = int(rc_throttle)
-        self.cmd.rc_pitch = int(1500 - pitch_output)
-        self.cmd.rc_roll = int(1500 + roll_output)
+        self.cmd.rc_pitch = int(1500 + pitch_output)
+        self.cmd.rc_roll = int(1500 - roll_output)
 
         self.command_pub.publish(self.cmd)
 
-    # Action server execution
+    # ------------------------- ACTION SERVER -------------------------
     def execute_callback(self, goal_handle):
 
         self.get_logger().info("Executing goal...")
@@ -258,7 +229,6 @@ class WayPointServer(Node):
 
         self.max_time_inside_sphere = 0.0
         self.point_in_sphere_start_time = None
-        self.time_inside_sphere = 0.0
 
         feedback_msg = NavToWaypoint.Feedback()
 
@@ -276,29 +246,32 @@ class WayPointServer(Node):
             inside = self.is_drone_in_sphere(self.current_state, goal_handle, 0.4)
 
             now = self.dtime
-            if inside and self.point_in_sphere_start_time is None:
-                self.point_in_sphere_start_time = now
 
-            elif inside:
+            if inside:
+                if self.point_in_sphere_start_time is None:
+                    self.point_in_sphere_start_time = now
+                    self.get_logger().info("Drone entered sphere")
+
+                # time inside sphere
                 t_inside = now - self.point_in_sphere_start_time
+                self.get_logger().info(f"Inside sphere: {t_inside:.2f}s")
+
                 if t_inside > self.max_time_inside_sphere:
                     self.max_time_inside_sphere = t_inside
+
                 if t_inside >= 3:
                     break
 
             else:
                 self.point_in_sphere_start_time = None
-                self.time_inside_sphere = 0
 
             time.sleep(0.01)
 
-        # Finish
         goal_handle.succeed()
         result = NavToWaypoint.Result()
-        result.hover_time = float(self.max_time_inside_sphere)
+        result.hover_time = int(self.max_time_inside_sphere)
         return result
 
-    # Distance check for sphere hover
     def is_drone_in_sphere(self, drone_pos, sphere_center, radius):
         return (
             (drone_pos[0] - sphere_center.request.waypoint.position.x) ** 2
