@@ -26,7 +26,7 @@ class WayPointServer(Node):
 
     def __init__(self):
         super().__init__("waypoint_server")
-    
+
         self.pid_or_lqr_callback_group = ReentrantCallbackGroup()
         self.action_callback_group = ReentrantCallbackGroup()
         self.odometry_callback_group = ReentrantCallbackGroup()
@@ -48,12 +48,20 @@ class WayPointServer(Node):
         self.cmd.rc_throttle = 1400
 
         # Initiate or declare other variables here depending upon whether you are implementing PID or LQR controller.
-        self.current_state = [0.0, 0.0, 0.0]  # x, y, z, yaw
+        self.current_state = [0.0, 0.0, 0.0]  # x, y, z
         self.desired_state = [0.0, 0.0, 0.0]
 
-        self.Kp = [1, 1, 0.75]
-        self.Ki = [0.00002, 0.00002, 0.000001 ]
-        self.Kd = [3, 3, 8]
+        # --- Moving average filter setup ---
+        # Window size for moving average (adjust as needed)
+        self.ma_window = 10
+        self.ma_x = deque(maxlen=self.ma_window)
+        self.ma_y = deque(maxlen=self.ma_window)
+        self.ma_z = deque(maxlen=self.ma_window)
+        # -----------------------------------
+
+        self.Kp = [1, 0, 16]
+        self.Ki = [0, 0, 0.0000000001]
+        self.Kd = [0, 0, 32]
 
         self.prev_error = [0.0, 0.0, 0.0]
         self.error_sum = [0.0, 0.0, 0.0]
@@ -65,7 +73,7 @@ class WayPointServer(Node):
         self.deadband = 1
 
         self.sample_time = (
-            0.01666  # put the appropriate value according to your controller
+            0.00866  # put the appropriate value according to your controller
         )
         self.last_time = self.get_clock().now().nanoseconds / 1e9
 
@@ -84,6 +92,8 @@ class WayPointServer(Node):
             10,
             callback_group=self.odometry_callback_group,
         )
+
+        self.movingAvgPublisher = self.create_publisher(Vector3, "/moving_average/pose", 10)
 
         # create an action server for the action 'NavToWaypoint'. Refer to Writing an action server and client (Python) in ROS 2 tutorials
         # action name should 'waypoint_navigation'.
@@ -130,14 +140,40 @@ class WayPointServer(Node):
 
         else:
             p = msg.poses[0]
-            self.current_state[0] = p.position.x
-            self.current_state[1] = p.position.y
-            self.current_state[2] = p.position.z 
+
+            # Append raw measurements into moving-average buffers
+            self.ma_x.append(p.position.x)
+            self.ma_y.append(p.position.y)
+            self.ma_z.append(p.position.z)
+
+            # Compute filtered (moving average) values. If buffer not yet full, average over available samples.
+            filtered_x = sum(self.ma_x) / len(self.ma_x)
+            filtered_y = sum(self.ma_y) / len(self.ma_y)
+            filtered_z = sum(self.ma_z) / len(self.ma_z)
+
+            # Update current_state with filtered values
+            # --- Low-pass filter (exponential smoothing) ---
+            alpha = 0.2
+            self.current_state[0] = alpha*filtered_x + (1-alpha)*self.current_state[0]
+            self.current_state[1] = alpha*filtered_y + (1-alpha)*self.current_state[1]
+            self.current_state[2] = alpha*filtered_z + (1-alpha)*self.current_state[2]
+            # ------------------------------------------------
+
+
+            self.movingAvgPublisher.publish(
+                Vector3(
+                    x=self.current_state[0],
+                    y=self.current_state[1],
+                    z=self.current_state[2],
+                )
+            )
+
+            # Update yaw from quaternion (kept unchanged)
             orientation_q = p.orientation
             _, _, yaw = euler_from_quaternion(
                 [orientation_q.x, orientation_q.y, orientation_q.z, orientation_q.w]
             )
-            # complete the function according to your controller as you did in task 1c.0
+            self.yaw = yaw
 
         self.dtime = msg.header.stamp.sec
 
@@ -174,7 +210,7 @@ class WayPointServer(Node):
 
         def compute_pid(axis, desired, current, prev_error, error_sum, diff_prev):
             error = desired - current
-            diff = 0.7*(error - prev_error) / dt
+            diff = 0.7 * (error - prev_error) / dt
             error_sum += error * dt
             output = (
                 (self.Kp[axis] * error)
@@ -211,44 +247,42 @@ class WayPointServer(Node):
             self.diff_x,
         )
 
-
         rc_throttle = int(1532 - throttle_output)
-        
-        if 1528<= rc_throttle & 1532 >= rc_throttle:
+
+        if 1527 <= rc_throttle and 1532 >= rc_throttle:
             rc_throttle = 1532
         if rc_throttle < 1528:
             rc_throttle = 1500 - throttle_output
-        
+
         rc_throttle = max(1450, min(1650, rc_throttle))
-        
+
         self.cmd.rc_throttle = int(rc_throttle)
         self.cmd.rc_pitch = int(1500 - pitch_output)
         self.cmd.rc_roll = int(1500 + roll_output)
-        
+
         self.command_pub.publish(self.cmd)
-        
-        
+
     def execute_callback(self, goal_handle):
 
-        self.get_logger().info('Executing goal...')
+        self.get_logger().info("Executing goal...")
         self.desired_state[0] = goal_handle.request.waypoint.position.x
         self.desired_state[1] = goal_handle.request.waypoint.position.y
-        self.desired_state[2] = goal_handle.request.waypoint.position.z 
+        self.desired_state[2] = goal_handle.request.waypoint.position.z
 
-        self.get_logger().info(f'New Waypoint Set: {self.desired_state}')
+        self.get_logger().info(f"New Waypoint Set: {self.desired_state}")
         self.max_time_inside_sphere = 0
         self.point_in_sphere_start_time = None
         self.time_inside_sphere = 0
         self.duration = self.dtime
 
-        #create a NavToWaypoint feedback object. Refer to Writing an action server and client (Python) in ROS 2 tutorials.
+        # create a NavToWaypoint feedback object. Refer to Writing an action server and client (Python) in ROS 2 tutorials.
         feedback_msg = NavToWaypoint.Feedback()
-        
-        #--------The script given below checks whether you are hovering at each of the waypoints(goals) for max of 3s---------#
+
+        # --------The script given below checks whether you are hovering at each of the waypoints(goals) for max of 3s---------#
         # This will help you to analyse the drone behaviour and help you to tune the PID better.
 
         while True:
-			#current whycon poses
+            # current whycon poses
             feedback_msg.current_position.pose.position.x = self.current_state[0]
             feedback_msg.current_position.pose.position.y = self.current_state[1]
             feedback_msg.current_position.pose.position.z = self.current_state[2]
@@ -256,40 +290,48 @@ class WayPointServer(Node):
 
             goal_handle.publish_feedback(feedback_msg)
 
-            drone_is_in_sphere = self.is_drone_in_sphere(self.current_state, goal_handle, 0.4) 
+            drone_is_in_sphere = self.is_drone_in_sphere(
+                self.current_state, goal_handle, 0.4
+            )
 
             # The value 0.08 is in meters used for as error range in Whycon coordinates for LQR controller. If you are using PID controller, it will become 0.8 as PID Whycon coordinates are in decimeters.
 
             if not drone_is_in_sphere and self.point_in_sphere_start_time is None:
-                        pass
-            
+                pass
+
             elif drone_is_in_sphere and self.point_in_sphere_start_time is None:
-                        self.point_in_sphere_start_time = self.dtime
-                        
-                        self.get_logger().info('Drone in sphere for 1st time')                        #you can choose to comment this out to get a better look at other logs
+                self.point_in_sphere_start_time = self.dtime
+
+                self.get_logger().info(
+                    "Drone in sphere for 1st time"
+                )  # you can choose to comment this out to get a better look at other logs
 
             elif drone_is_in_sphere and self.point_in_sphere_start_time is not None:
-                        self.time_inside_sphere = self.dtime - self.point_in_sphere_start_time
-                        self.get_logger().info('Drone in sphere')                                     #you can choose to comment this out to get a better look at other logs
-                             
+                self.time_inside_sphere = self.dtime - self.point_in_sphere_start_time
+                self.get_logger().info(
+                    "Drone in sphere"
+                )  # you can choose to comment this out to get a better look at other logs
+
             elif not drone_is_in_sphere and self.point_in_sphere_start_time is not None:
-                        self.get_logger().info('Drone out of sphere')                                 #you can choose to comment this out to get a better look at other logs
-                        self.point_in_sphere_start_time = None
+                self.get_logger().info(
+                    "Drone out of sphere"
+                )  # you can choose to comment this out to get a better look at other logs
+                self.point_in_sphere_start_time = None
 
             if self.time_inside_sphere > self.max_time_inside_sphere:
-                 self.max_time_inside_sphere = self.time_inside_sphere
+                self.max_time_inside_sphere = self.time_inside_sphere
 
             if self.max_time_inside_sphere >= 3:
-                 break
-                        
+                break
 
         goal_handle.succeed()
 
-        #create a NavToWaypoint result object. Refer to Writing an action server and client (Python) in ROS 2 tutorials
+        # create a NavToWaypoint result object. Refer to Writing an action server and client (Python) in ROS 2 tutorials
         result = NavToWaypoint.Result()
 
-
-        result.hover_time = self.dtime - self.duration #this is the total time taken by the drone in trying to stabilize at a point
+        result.hover_time = (
+            self.dtime - self.duration
+        )  # this is the total time taken by the drone in trying to stabilize at a point
         return result
 
     def is_drone_in_sphere(self, drone_pos, sphere_center, radius):
