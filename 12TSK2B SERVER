@@ -1,0 +1,307 @@
+#!/usr/bin/env python3
+
+import time
+import math
+from collections import deque
+
+import cv2
+import numpy as np
+from cv_bridge import CvBridge
+from tf_transformations import euler_from_quaternion
+
+import rclpy
+from rclpy.action import ActionServer
+from rclpy.node import Node
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
+
+from waypoint_navigation.action import NavToWaypoint
+from swift_msgs.msg import SwiftMsgs
+from geometry_msgs.msg import PoseArray, Vector3
+from nav_msgs.msg import Odometry
+from sensor_msgs.msg import Image
+from std_msgs.msg import String
+
+
+HSV_YELLOW_RANGE = (np.array([20, 50, 100]), np.array([35, 255, 255]))
+PLANT_BLOCK_Z_THRESHOLD = 31.5
+SPHERE_RADIUS = 0.3
+
+
+class WayPointServer(Node):
+
+    def __init__(self):
+        super().__init__("waypoint_server")
+
+        self.pid_or_lqr_callback_group = ReentrantCallbackGroup()
+        self.action_callback_group = ReentrantCallbackGroup()
+
+        self.current_state = [0.0, 0.0, 0.0, 0.0]
+        self.desired_state = [0.0, 0.0, 0.0, 0.0]
+
+        self.cmd = SwiftMsgs()
+        self.cmd.rc_roll = 1500
+        self.cmd.rc_pitch = 1500
+        self.cmd.rc_yaw = 1500
+        self.cmd.rc_throttle = 1400
+
+        # Moving average filter
+        self.ma_window = 20
+        self.ma_x = deque(maxlen=self.ma_window)
+        self.ma_y = deque(maxlen=self.ma_window)
+        self.ma_z = deque(maxlen=self.ma_window)
+
+        # PID GAINS
+        self.Kp = [14.0, 14.0, 16.5, 0]
+        self.Ki = [0.000000008, 0.000000008, 1, 0]
+        self.Kd = [22.0, 22.0, 32.4, 0]
+
+        self.prev_error = [0.0, 0.0, 0.0]
+        self.error_sum = [0.0, 0.0, 0.0]
+        self.diff_x = 0.0
+        self.diff_y = 0.0
+        self.diff_z = 0.0
+
+        self.sample_time = 0.00866
+        self.last_time = self.get_clock().now().nanoseconds / 1e9
+
+        # Publishers & Subscribers
+        self.command_pub = self.create_publisher(SwiftMsgs, "/drone_command", 10)
+        self.detect_pub = self.create_publisher(String, "/infected_plant_detected", 10)
+        self.movingAvgPublisher = self.create_publisher(Vector3, "/moving_average/pose", 10)
+
+        self.whycon_sub = self.create_subscription(PoseArray, "/whycon/poses", self.whycon_callback, 10)
+        self.odom_sub = self.create_subscription(Odometry, "/rotors/odometry", self.odometry_callback, 10)
+        self.image_sub = self.create_subscription(Image, "/whycon/image_out", self.image_callback, 10)
+
+        self.bridge = CvBridge()
+        self.current_frame = None
+
+        # Stabilization flag
+        self.is_stabilizing = False
+
+        # Action server
+        self._action_server = ActionServer(
+            self,
+            NavToWaypoint,
+            "waypoint_navigation",
+            self.execute_callback,
+            callback_group=self.action_callback_group,
+        )
+
+        self.arm()
+
+        self.timer = self.create_timer(self.sample_time, self.pid,
+                                       callback_group=self.pid_or_lqr_callback_group)
+
+    # ARM / DISARM -----------------------------------------------------------
+
+    def disarm(self):
+        self.cmd.rc_roll = 1000
+        self.cmd.rc_pitch = 1000
+        self.cmd.rc_yaw = 1000
+        self.cmd.rc_throttle = 1000
+        self.cmd.rc_aux4 = 1000
+        self.command_pub.publish(self.cmd)
+
+    def arm(self):
+        self.disarm()
+        self.cmd.rc_roll = 1500
+        self.cmd.rc_pitch = 1500
+        self.cmd.rc_yaw = 1500
+        self.cmd.rc_throttle = 1500
+        self.cmd.rc_aux4 = 2000
+        self.command_pub.publish(self.cmd)
+
+    # WHYCON CALLBACK --------------------------------------------------------
+
+    def whycon_callback(self, msg):
+        if not msg.poses:
+            return
+
+        p = msg.poses[0]
+
+        self.ma_x.append(p.position.x)
+        self.ma_y.append(p.position.y)
+        self.ma_z.append(p.position.z)
+
+        fx = sum(self.ma_x) / len(self.ma_x)
+        fy = sum(self.ma_y) / len(self.ma_y)
+        fz = sum(self.ma_z) / len(self.ma_z)
+
+        self.current_state[0] = 0.2*fx + 0.8*self.current_state[0]
+        self.current_state[1] = 0.2*fy + 0.8*self.current_state[1]
+        self.current_state[2] = 0.4*fz + 0.6*self.current_state[2]
+
+        self.movingAvgPublisher.publish(Vector3(
+            x=self.current_state[0],
+            y=self.current_state[1],
+            z=self.current_state[2]
+        ))
+
+    # ODOMETRY CALLBACK ------------------------------------------------------
+
+    def odometry_callback(self, msg):
+        q = msg.pose.pose.orientation
+        roll, pitch, yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])
+        self.roll_deg = math.degrees(roll)
+        self.pitch_deg = math.degrees(pitch)
+        self.yaw_deg = math.degrees(yaw)
+
+    # IMAGE CALLBACK ---------------------------------------------------------
+
+    def image_callback(self, msg):
+        try:
+            self.current_frame = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+        except:
+            pass
+
+    # DETECTION --------------------------------------------------------------
+
+    def detect_infection(self):
+        if self.current_frame is None:
+            return False
+
+        hsv = cv2.cvtColor(self.current_frame, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, HSV_YELLOW_RANGE[0], HSV_YELLOW_RANGE[1])
+
+        return (np.count_nonzero(mask) / mask.size * 100) > 1.0
+
+    # PID LOOP ---------------------------------------------------------------
+
+    def pid(self):
+        now = self.get_clock().now().nanoseconds / 1e9
+        dt = now - self.last_time
+        if dt <= 0:
+            dt = self.sample_time
+        self.last_time = now
+
+        def compute_pid(axis, desired, current, prev, isum, diff_prev):
+            error = desired - current
+            diff = 0.7 * (error - prev) / dt
+            isum += error * dt
+            output = (
+                self.Kp[axis]*error +
+                self.Ki[axis]*isum +
+                self.Kd[axis]*diff
+            )
+            return output, error, isum, diff_prev
+
+        throttle_output, self.prev_error[2], self.error_sum[2], _ = compute_pid(
+            2, self.desired_state[2]-0.1, self.current_state[2],
+            self.prev_error[2], self.error_sum[2], self.diff_z
+        )
+
+        pitch_output, self.prev_error[0], self.error_sum[0], _ = compute_pid(
+            0, self.desired_state[0], self.current_state[0],
+            self.prev_error[0], self.error_sum[0], self.diff_y
+        )
+
+        roll_output, self.prev_error[1], self.error_sum[1], _ = compute_pid(
+            1, self.current_state[1], self.desired_state[1],
+            self.prev_error[1], self.error_sum[1], self.diff_x
+        )
+
+        BASE_THR = 1535
+        rc_throttle = int(BASE_THR - throttle_output)
+        rc_throttle = max(1480, min(1650, rc_throttle))
+
+        self.cmd.rc_throttle = rc_throttle
+        self.cmd.rc_pitch = int(1500 + pitch_output)
+        self.cmd.rc_roll = int(1500 - roll_output)
+
+        self.command_pub.publish(self.cmd)
+
+    # STABILITY HOVER ACTION -------------------------------------------------
+
+    def hover_action(self, label, duration):
+        self.get_logger().info(f"[ACTION] Hovering for {duration}s → {label}")
+        start = time.time()
+        while time.time() - start < duration:
+            time.sleep(0.05)
+        self.get_logger().info(f"[ACTION] Hover complete → {label}")
+
+    # ACTION SERVER (MAIN) ---------------------------------------------------
+
+    def execute_callback(self, goal_handle):
+
+        goal = goal_handle.request.waypoint
+
+        self.desired_state[0] = goal.position.x
+        self.desired_state[1] = goal.position.y
+        self.desired_state[2] = goal.position.z
+
+        q = goal.orientation
+        _, _, yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])
+        self.desired_state[3] = yaw
+
+        x, y, z = self.desired_state[:3]
+
+        STAB = [
+            (-9.11, 9.27, 31.27),
+            (-9.07, 9.23, 32.57)
+        ]
+
+        def near(a, b):
+            return abs(a[0]-b[0]) < 0.3 and abs(a[1]-b[1]) < 0.3 and abs(a[2]-b[2]) < 0.3
+
+        do_stab = any(near((x, y, z), p) for p in STAB)
+
+        stable_start = None
+
+        # WAIT FOR WAYPOINT + 2.2s STABILITY
+        while rclpy.ok():
+
+            dist = math.dist(self.current_state[:3], self.desired_state[:3])
+
+            if dist < SPHERE_RADIUS:
+
+                # Stability window = 2.2 seconds
+                if do_stab:
+                    if stable_start is None:
+                        self.get_logger().info("[STABILITY] Drone reached target → Waiting for 2.2 seconds stability")
+                        stable_start = time.time()
+                        self.is_stabilizing = True
+
+                    elapsed = time.time() - stable_start
+                    self.get_logger().info(f"[STABILITY] Holding steady: {elapsed:.2f} / 2.20s")
+
+                    if elapsed < 2.2:
+                        time.sleep(0.05)
+                        continue
+
+                break
+
+            else:
+                stable_start = None
+                self.is_stabilizing = False
+
+            time.sleep(0.05)
+
+        self.is_stabilizing = False
+
+        # NORMAL NAV COMPLETE
+        self.get_logger().info("[NAV] Reached waypoint successfully")
+        goal_handle.succeed()
+        return NavToWaypoint.Result()
+
+
+# MAIN ----------------------------------------------------------------------
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = WayPointServer()
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
+
+    try:
+        executor.spin()
+    except KeyboardInterrupt:
+        pass
+
+    node.destroy()
+    rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
