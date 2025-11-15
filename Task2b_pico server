@@ -2,9 +2,16 @@
 
 import time
 import math
+from collections import deque
+
+import cv2
+import numpy as np
+from cv_bridge import CvBridge
+from tf_transformations import euler_from_quaternion
+
 import rclpy
-from rclpy.node import Node
 from rclpy.action import ActionServer
+from rclpy.node import Node
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 
@@ -12,19 +19,13 @@ from waypoint_navigation.action import NavToWaypoint
 from swift_msgs.msg import SwiftMsgs
 from geometry_msgs.msg import PoseArray, Vector3
 from nav_msgs.msg import Odometry
-from std_msgs.msg import String
 from sensor_msgs.msg import Image
-from cv_bridge import CvBridge
-from tf_transformations import euler_from_quaternion
-from collections import deque
+from std_msgs.msg import String
 
-import cv2
-import numpy as np
 
-# ---------------------------------------------------------------
 HSV_YELLOW_RANGE = (np.array([20, 50, 100]), np.array([35, 255, 255]))
 PLANT_BLOCK_Z_THRESHOLD = 31.5
-# ---------------------------------------------------------------
+SPHERE_RADIUS = 0.4
 
 
 class WayPointServer(Node):
@@ -34,7 +35,6 @@ class WayPointServer(Node):
 
         self.pid_or_lqr_callback_group = ReentrantCallbackGroup()
         self.action_callback_group = ReentrantCallbackGroup()
-        self.odometry_callback_group = ReentrantCallbackGroup()
 
         self.current_state = [0.0, 0.0, 0.0, 0.0]
         self.desired_state = [0.0, 0.0, 0.0, 0.0]
@@ -45,28 +45,30 @@ class WayPointServer(Node):
         self.cmd.rc_yaw = 1500
         self.cmd.rc_throttle = 1400
 
+        # Moving average filter
         self.ma_window = 20
         self.ma_x = deque(maxlen=self.ma_window)
         self.ma_y = deque(maxlen=self.ma_window)
         self.ma_z = deque(maxlen=self.ma_window)
 
+        # PID GAINS
         self.Kp = [14.0, 14.0, 16.5, 0]
         self.Ki = [0.000000008, 0.000000008, 1, 0]
         self.Kd = [22.0, 22.0, 32.5, 0]
 
+        self.prev_error = [0.0, 0.0, 0.0]
+        self.error_sum = [0.0, 0.0, 0.0]
         self.diff_x = 0.0
         self.diff_y = 0.0
         self.diff_z = 0.0
 
-        self.prev_error = [0.0, 0.0, 0.0]
-        self.error_sum = [0.0, 0.0, 0.0]
-        self.prev_output = [1500, 1500, 1500]
-
         self.sample_time = 0.00866
         self.last_time = self.get_clock().now().nanoseconds / 1e9
 
+        # Publishers & Subscribers
         self.command_pub = self.create_publisher(SwiftMsgs, "/drone_command", 10)
         self.detect_pub = self.create_publisher(String, "/infected_plant_detected", 10)
+        self.movingAvgPublisher = self.create_publisher(Vector3, "/moving_average/pose", 10)
 
         self.whycon_sub = self.create_subscription(PoseArray, "/whycon/poses", self.whycon_callback, 10)
         self.odom_sub = self.create_subscription(Odometry, "/rotors/odometry", self.odometry_callback, 10)
@@ -75,8 +77,10 @@ class WayPointServer(Node):
         self.bridge = CvBridge()
         self.current_frame = None
 
-        self.movingAvgPublisher = self.create_publisher(Vector3, "/moving_average/pose", 10)
+        # Stabilization flag
+        self.is_stabilizing = False
 
+        # Action server
         self._action_server = ActionServer(
             self,
             NavToWaypoint,
@@ -86,8 +90,11 @@ class WayPointServer(Node):
         )
 
         self.arm()
+
         self.timer = self.create_timer(self.sample_time, self.pid,
                                        callback_group=self.pid_or_lqr_callback_group)
+
+    # ARM / DISARM -----------------------------------------------------------
 
     def disarm(self):
         self.cmd.rc_roll = 1000
@@ -106,6 +113,8 @@ class WayPointServer(Node):
         self.cmd.rc_aux4 = 2000
         self.command_pub.publish(self.cmd)
 
+    # WHYCON CALLBACK --------------------------------------------------------
+
     def whycon_callback(self, msg):
         if not msg.poses:
             return
@@ -120,9 +129,9 @@ class WayPointServer(Node):
         fy = sum(self.ma_y) / len(self.ma_y)
         fz = sum(self.ma_z) / len(self.ma_z)
 
-        self.current_state[0] = 0.2 * fx + 0.8 * self.current_state[0]
-        self.current_state[1] = 0.2 * fy + 0.8 * self.current_state[1]
-        self.current_state[2] = 0.4 * fz + 0.6 * self.current_state[2]
+        self.current_state[0] = 0.2*fx + 0.8*self.current_state[0]
+        self.current_state[1] = 0.2*fy + 0.8*self.current_state[1]
+        self.current_state[2] = 0.4*fz + 0.6*self.current_state[2]
 
         self.movingAvgPublisher.publish(Vector3(
             x=self.current_state[0],
@@ -130,9 +139,7 @@ class WayPointServer(Node):
             z=self.current_state[2]
         ))
 
-        q = p.orientation
-        _, _, yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])
-        self.yaw = yaw
+    # ODOMETRY CALLBACK ------------------------------------------------------
 
     def odometry_callback(self, msg):
         q = msg.pose.pose.orientation
@@ -141,92 +148,88 @@ class WayPointServer(Node):
         self.pitch_deg = math.degrees(pitch)
         self.yaw_deg = math.degrees(yaw)
 
+    # IMAGE CALLBACK ---------------------------------------------------------
+
     def image_callback(self, msg):
         try:
             self.current_frame = self.bridge.imgmsg_to_cv2(msg, "bgr8")
         except:
             pass
 
+    # DETECTION --------------------------------------------------------------
+
     def detect_infection(self):
         if self.current_frame is None:
             return False
+
         hsv = cv2.cvtColor(self.current_frame, cv2.COLOR_BGR2HSV)
         mask = cv2.inRange(hsv, HSV_YELLOW_RANGE[0], HSV_YELLOW_RANGE[1])
+
         return (np.count_nonzero(mask) / mask.size * 100) > 1.0
 
-    def pid(self):
+    # PID LOOP ---------------------------------------------------------------
 
+    def pid(self):
         now = self.get_clock().now().nanoseconds / 1e9
         dt = now - self.last_time
         if dt <= 0:
             dt = self.sample_time
         self.last_time = now
 
-        def compute_pid(axis, desired, current, prev_error, error_sum, diff_prev):
-
+        def compute_pid(axis, desired, current, prev, isum, diff_prev):
             error = desired - current
-            diff = 0.7 * (error - prev_error) / dt
-            error_sum += error * dt
-
+            diff = 0.7 * (error - prev) / dt
+            isum += error * dt
             output = (
-                    (self.Kp[axis] * error)
-                    + (self.Ki[axis] * error_sum)
-                    + (self.Kd[axis] * diff)
+                self.Kp[axis]*error +
+                self.Ki[axis]*isum +
+                self.Kd[axis]*diff
             )
+            return output, error, isum, diff_prev
 
-            return output, error, error_sum, diff
-
-        throttle_output, self.prev_error[2], self.error_sum[2], self.diff_z = compute_pid(
-            2, self.desired_state[2] - 0.1, self.current_state[2],
+        throttle_output, self.prev_error[2], self.error_sum[2], _ = compute_pid(
+            2, self.desired_state[2]-0.1, self.current_state[2],
             self.prev_error[2], self.error_sum[2], self.diff_z
         )
 
-        pitch_output, self.prev_error[0], self.error_sum[0], self.diff_y = compute_pid(
+        pitch_output, self.prev_error[0], self.error_sum[0], _ = compute_pid(
             0, self.desired_state[0], self.current_state[0],
             self.prev_error[0], self.error_sum[0], self.diff_y
         )
 
-        roll_output, self.prev_error[1], self.error_sum[1], self.diff_x = compute_pid(
+        roll_output, self.prev_error[1], self.error_sum[1], _ = compute_pid(
             1, self.current_state[1], self.desired_state[1],
             self.prev_error[1], self.error_sum[1], self.diff_x
         )
 
-        # -------------------------------
-        # SAFE THROTTLE LOGIC (FIX TAKEOFF)
-        # -------------------------------
-        BASE_THR = 1535  # Required hover throttle for Pico
-
+        BASE_THR = 1535
         rc_throttle = int(BASE_THR - throttle_output)
-
-        # Clamp throttle safely
         rc_throttle = max(1480, min(1650, rc_throttle))
 
-        self.cmd.rc_throttle = int(rc_throttle)
+        self.cmd.rc_throttle = rc_throttle
         self.cmd.rc_pitch = int(1500 + pitch_output)
         self.cmd.rc_roll = int(1500 - roll_output)
 
         self.command_pub.publish(self.cmd)
 
-    # -------------------------------------------------
-    # HOVER ACTION
-    # -------------------------------------------------
+    # STABILITY HOVER ACTION -------------------------------------------------
+
     def hover_action(self, label, duration):
         self.get_logger().info(f"[ACTION] Hovering for {duration}s → {label}")
         start = time.time()
-        while time.time() - start < duration and rclpy.ok():
+        while time.time() - start < duration:
             time.sleep(0.05)
         self.get_logger().info(f"[ACTION] Hover complete → {label}")
 
-    # -------------------------------------------------
+    # ACTION SERVER (MAIN) ---------------------------------------------------
 
     def execute_callback(self, goal_handle):
 
         goal = goal_handle.request.waypoint
-        self.desired_state[:3] = [
-            goal.position.x,
-            goal.position.y,
-            goal.position.z
-        ]
+
+        self.desired_state[0] = goal.position.x
+        self.desired_state[1] = goal.position.y
+        self.desired_state[2] = goal.position.z
 
         q = goal.orientation
         _, _, yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])
@@ -234,107 +237,58 @@ class WayPointServer(Node):
 
         x, y, z = self.desired_state[:3]
 
-        stage = "NAV"
-        if z > 32.0:
-            stage = "PICKUP"
-        elif z < PLANT_BLOCK_Z_THRESHOLD:
-            stage = "BLOCK"
-
-        # stability points
         STAB = [
-            
-            (-9.11, 9.27, 31.27),
             (-8.62, -8.6, 29.6),
-            (-9.07, 9.23, 32.57),
-            (-8.53, -8.52, 30.64)
+            (-8.53, -8.52, 30.64),
+            (-9.11, 9.27, 31.27),
+            (-9.07, 9.23, 32.57)
         ]
 
-        def need_stab(px, py, pz):
-            for sx, sy, sz in STAB:
-                if abs(px - sx) < 0.3 and abs(py - sy) < 0.3 and abs(pz - sz) < 0.3:
-                    return True
-            return False
+        def near(a, b):
+            return abs(a[0]-b[0]) < 0.3 and abs(a[1]-b[1]) < 0.3 and abs(a[2]-b[2]) < 0.3
 
-        do_stab = need_stab(x, y, z)
+        do_stab = any(near((x, y, z), p) for p in STAB)
 
-        feedback = NavToWaypoint.Feedback()
-        result = NavToWaypoint.Result()
-
-        # REACH waypoint loop
         stable_start = None
+
+        # WAIT FOR WAYPOINT + 2.3s STABILITY
         while rclpy.ok():
-            feedback.current_position.pose.position.x = self.current_state[0]
-            feedback.current_position.pose.position.y = self.current_state[1]
-            feedback.current_position.pose.position.z = self.current_state[2]
-            goal_handle.publish_feedback(feedback)
 
             dist = math.dist(self.current_state[:3], self.desired_state[:3])
-            if dist < 0.4:
 
+            if dist < SPHERE_RADIUS:
+
+                # Stability window = 2.3 seconds
                 if do_stab:
                     if stable_start is None:
-                        self.get_logger().info("[STABILITY] Drone reached target → Waiting for 2 seconds stability")
+                        self.get_logger().info("[STABILITY] Drone reached target → Waiting for 2.3 seconds stability")
                         stable_start = time.time()
+                        self.is_stabilizing = True
 
                     elapsed = time.time() - stable_start
-                    self.get_logger().info(f"[STABILITY] Holding steady: {elapsed:.2f} / 2.00s")
+                    self.get_logger().info(f"[STABILITY] Holding steady: {elapsed:.2f} / 2.30s")
 
-                    if elapsed < 2.0:
+                    if elapsed < 2.3:
                         time.sleep(0.05)
                         continue
 
                 break
+
             else:
                 stable_start = None
+                self.is_stabilizing = False
 
             time.sleep(0.05)
 
-        # ---------------- PICKUP ----------------
-        if stage == "PICKUP":
-            self.get_logger().info("[ACTION] Drone arrived at pesticide station")
-            self.hover_action("Pesticide Collection", 2.0)
-            goal_handle.succeed()
-            return result
+        self.is_stabilizing = False
 
-        # ---------------- BLOCK ----------------
-        if stage == "BLOCK":
-
-            self.get_logger().info("[SCAN] Starting plant infection scan (2 seconds)…")
-
-            detect_start = time.time()
-            infected = False
-            while time.time() - detect_start < 2.0:
-                if self.detect_infection():
-                    infected = True
-                time.sleep(0.05)
-
-            msg = String()
-            health_status = "INFECTED" if infected else "HEALTHY"
-            msg.data = f"[SCAN RESULT] Plant ({x:.2f}, {y:.2f}) → {health_status}"
-            self.detect_pub.publish(msg)
-            self.get_logger().info(msg.data)
-
-            if infected:
-                self.hover_action("Inspection Hover", 2.0)
-
-                spray_alt = z - 1.0
-                self.desired_state[2] = spray_alt
-                self.get_logger().info(f"[SPRAY] Descending to spraying altitude: {spray_alt:.2f}m")
-                time.sleep(1.0)
-
-                self.hover_action("Pesticide Spraying", 2.0)
-
-                self.desired_state[2] = spray_alt + 1.0
-                self.get_logger().info("[SPRAY] Returning to hover altitude")
-
-            goal_handle.succeed()
-            return result
-
-        # ---------------- NORMAL NAV ----------------
+        # NORMAL NAV COMPLETE
         self.get_logger().info("[NAV] Reached waypoint successfully")
         goal_handle.succeed()
-        return result
+        return NavToWaypoint.Result()
 
+
+# MAIN ----------------------------------------------------------------------
 
 def main(args=None):
     rclpy.init(args=args)
@@ -346,9 +300,9 @@ def main(args=None):
         executor.spin()
     except KeyboardInterrupt:
         pass
-    finally:
-        node.destroy_node()
-        rclpy.shutdown()
+
+    node.destroy()
+    rclpy.shutdown()
 
 
 if __name__ == "__main__":
