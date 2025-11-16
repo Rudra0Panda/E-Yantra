@@ -1,0 +1,311 @@
+#!/usr/bin/env python3
+
+# This python file runs a ROS 2-node of name waypoint_server which implements an action server to navigate the Swift Pico Drone to the given waypoints.
+# You can use either PID or LQR controller to navigate the drone to the given waypoints.
+
+import time
+import math
+from tf_transformations import euler_from_quaternion
+
+import rclpy
+from rclpy.action import ActionServer
+from rclpy.node import Node
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
+from waypoint_navigation.action import NavToWaypoint
+from waypoint_navigation.srv import GetWaypoints
+from swift_msgs.msg import SwiftMsgs
+from geometry_msgs.msg import PoseArray, Vector3, Pose, PoseStamped
+from error_msg.msg import Error
+from nav_msgs.msg import Odometry
+from collections import deque
+
+
+class WayPointServer(Node):
+
+    def __init__(self):
+        super().__init__("waypoint_server")
+
+        self.pid_or_lqr_callback_group = ReentrantCallbackGroup()
+        self.action_callback_group = ReentrantCallbackGroup()
+        self.odometry_callback_group = ReentrantCallbackGroup()
+
+        self.time_inside_sphere = 0.0
+        self.max_time_inside_sphere = 0.0
+        self.point_in_sphere_start_time = None
+        self.duration = 0.0
+
+        self.yaw = 0.0
+        self.xyz = [0.0, 0.0, 0.0, 0.0]
+        self.dtime = 0.0
+
+        # Declaring a cmd of message type swift_msgs and initializing values
+        self.cmd = SwiftMsgs()
+        self.cmd.rc_roll = 1500
+        self.cmd.rc_pitch = 1500
+        self.cmd.rc_yaw = 1500
+        self.cmd.rc_throttle = 1400
+
+        self.current_state = [0.0, 0.0, 0.0]  # x, y, z
+        self.desired_state = [0.0, 0.0, 0.0]
+
+        # --- Moving average filter setup ---
+        self.ma_window = 20
+        self.ma_x = deque(maxlen=self.ma_window)
+        self.ma_y = deque(maxlen=self.ma_window)
+        self.ma_z = deque(maxlen=self.ma_window)
+        # -----------------------------------
+
+        self.Kp = [14.0, 14.0, 10.5]
+        self.Ki = [0.000000008, 0.000000008, 0.55]
+        self.Kd = [22.0, 22.0, 32.5]
+
+        self.prev_error = [0.0, 0.0, 0.0]
+        self.error_sum = [0.0, 0.0, 0.0]
+        self.prev_output = [1500, 1500, 1500]
+
+        # Anti-windup / integral settings
+        self.alpha = 1
+        self.beta = 1
+        self.integral_limit = 60.0  # maximum magnitude of integral term (seconds*error units)
+        self.deadband = 1
+
+        self.sample_time = 0.00866
+        self.last_time = self.get_clock().now().nanoseconds / 1e9
+
+        self.diff_x = self.diff_y = self.diff_z = self.diff_yaw = 0.0
+        self.max_values = [2000, 2000, 2000]
+        self.min_values = [1000, 1000, 1000]
+
+        self.command_pub = self.create_publisher(SwiftMsgs, "/drone_command", 10)
+        self.pos_error_pub = self.create_publisher(Error, "/position_error", 10)
+
+        self.create_subscription(PoseArray, "/whycon/poses", self.whycon_callback, 1)
+        self.odometry_subscription = self.create_subscription(
+            Odometry, "/rotors/odometry", self.odometry_callback, 10,
+            callback_group=self.odometry_callback_group,
+        )
+
+        self.movingAvgPublisher = self.create_publisher(Vector3, "/moving_average/pose", 10)
+
+        # Action server
+        self._action_server = ActionServer(
+            self,
+            NavToWaypoint,
+            "waypoint_navigation",
+            self.execute_callback,
+            callback_group=self.action_callback_group,
+        )
+
+        self.arm()
+
+        self.timer = self.create_timer(
+            self.sample_time, self.pid, callback_group=self.pid_or_lqr_callback_group
+        )
+
+    def disarm(self):
+        self.cmd.rc_roll = 1000
+        self.cmd.rc_yaw = 1000
+        self.cmd.rc_pitch = 1000
+        self.cmd.rc_throttle = 1000
+        self.cmd.rc_aux4 = 1000
+        self.command_pub.publish(self.cmd)
+
+    def arm(self):
+        self.disarm()
+        self.cmd.rc_roll = 1500
+        self.cmd.rc_yaw = 1500
+        self.cmd.rc_pitch = 1500
+        self.cmd.rc_throttle = 1500
+        self.cmd.rc_aux4 = 2000
+        self.command_pub.publish(self.cmd)
+
+    def whycon_callback(self, msg):
+
+        if not msg.poses or len(msg.poses) == 0:
+            self.get_logger().warn("No poses received")
+            return
+
+        p = msg.poses[0]
+
+        # MOVING AVERAGE
+        self.ma_x.append(p.position.x)
+        self.ma_y.append(p.position.y)
+        self.ma_z.append(p.position.z)
+
+        filtered_x = sum(self.ma_x) / len(self.ma_x)
+        filtered_y = sum(self.ma_y) / len(self.ma_y)
+        filtered_z = sum(self.ma_z) / len(self.ma_z)
+
+        alpha = 0.2
+        alpha_z=0.4
+        self.current_state[0] = alpha * filtered_x + (1 - alpha) * self.current_state[0]
+        self.current_state[1] = alpha * filtered_y + (1 - alpha) * self.current_state[1]
+        self.current_state[2] = alpha_z * filtered_z + (1 - alpha_z) * self.current_state[2]
+
+        self.movingAvgPublisher.publish(Vector3(
+            x=self.current_state[0],
+            y=self.current_state[1],
+            z=self.current_state[2],
+        ))
+
+        orientation_q = p.orientation
+        _, _, yaw = euler_from_quaternion(
+            [orientation_q.x, orientation_q.y, orientation_q.z, orientation_q.w]
+        )
+        self.yaw = yaw
+
+        try:
+            self.dtime = msg.header.stamp.sec + msg.header.stamp.nanosec / 1e9
+        except:
+            self.dtime = self.get_clock().now().nanoseconds / 1e9
+
+    def odometry_callback(self, msg):
+        orientation_q = msg.pose.pose.orientation
+        roll, pitch, yaw = euler_from_quaternion(
+            [orientation_q.x, orientation_q.y, orientation_q.z, orientation_q.w]
+        )
+        self.roll_deg = math.degrees(roll)
+        self.pitch_deg = math.degrees(pitch)
+        self.yaw_deg = math.degrees(yaw)
+
+    def pid(self):
+
+        now = self.get_clock().now().nanoseconds / 1e9
+        dt = now - self.last_time
+        if dt <= 0:
+            dt = self.sample_time
+        self.last_time = now
+
+        def compute_pid(axis, desired, current, prev_error, error_sum, diff_prev):
+
+            error = desired - current
+
+            # derivative (filtered by constant 0.7 as before)
+            diff = 0.7 * (error - prev_error) / dt
+
+            # integrate with anti-windup (clamp integral)
+            error_sum += error * dt
+            # clamp integral to prevent windup
+            if error_sum > self.integral_limit:
+                error_sum = self.integral_limit
+            elif error_sum < -self.integral_limit:
+                error_sum = -self.integral_limit
+
+            output = (
+                (self.Kp[axis] * error)
+                + (self.Ki[axis] * error_sum)
+                + (self.Kd[axis] * diff)
+            )
+
+            return output, error, error_sum, diff
+
+        throttle_output, self.prev_error[2], self.error_sum[2], self.diff_z = compute_pid(
+            2, self.desired_state[2]-0.1 , self.current_state[2],
+            self.prev_error[2], self.error_sum[2], self.diff_z
+        )
+
+        pitch_output, self.prev_error[0], self.error_sum[0], self.diff_y = compute_pid(
+            0,self.desired_state[0],self.current_state[0],
+            self.prev_error[0], self.error_sum[0], self.diff_y
+        )
+
+        roll_output, self.prev_error[1], self.error_sum[1], self.diff_x = compute_pid(
+            1,self.current_state[1],self.desired_state[1],
+            self.prev_error[1], self.error_sum[1], self.diff_x
+        )
+
+        rc_throttle = int(1532 - throttle_output)
+
+        if 1527 <= rc_throttle <= 1532:
+            rc_throttle = 1532
+        if rc_throttle < 1528:
+            rc_throttle = 1500 - throttle_output
+
+        rc_throttle = max(1450, min(1650, rc_throttle))
+
+        self.cmd.rc_throttle = int(rc_throttle)
+        self.cmd.rc_pitch = int(1500 + pitch_output)
+        self.cmd.rc_roll = int(1500 - roll_output)
+
+        self.command_pub.publish(self.cmd)
+
+    # ------------------------- ACTION SERVER -------------------------
+    def execute_callback(self, goal_handle):
+
+        self.get_logger().info("Executing goal...")
+        # Set desired state for this new goal (note: no integral reset)
+        self.desired_state[0] = goal_handle.request.waypoint.position.x
+        self.desired_state[1] = goal_handle.request.waypoint.position.y
+        self.desired_state[2] = goal_handle.request.waypoint.position.z
+
+        self.max_time_inside_sphere = 0.0
+        self.point_in_sphere_start_time = None
+
+        feedback_msg = NavToWaypoint.Feedback()
+
+        while rclpy.ok():
+
+            feedback_msg.current_position.pose.position.x = self.current_state[0]
+            feedback_msg.current_position.pose.position.y = self.current_state[1]
+            feedback_msg.current_position.pose.position.z = self.current_state[2]
+
+            t = self.dtime
+            feedback_msg.current_position.header.stamp.sec = int(t)
+
+            goal_handle.publish_feedback(feedback_msg)
+
+            inside = self.is_drone_in_sphere(self.current_state, goal_handle, 0.4)
+
+            now = self.dtime
+
+            if inside:
+                if self.point_in_sphere_start_time is None:
+                    self.point_in_sphere_start_time = now
+                    self.get_logger().info("Drone entered sphere")
+
+                # time inside sphere
+                t_inside = now - self.point_in_sphere_start_time
+                self.get_logger().info(f"Inside sphere: {t_inside:.2f}s")
+
+                if t_inside > self.max_time_inside_sphere:
+                    self.max_time_inside_sphere = t_inside
+
+                if t_inside >= 2.5:
+                    break
+
+            else:
+                self.point_in_sphere_start_time = None
+
+            time.sleep(0.01)
+
+        goal_handle.succeed()
+        result = NavToWaypoint.Result()
+        result.hover_time = int(self.max_time_inside_sphere)
+        return result
+
+    def is_drone_in_sphere(self, drone_pos, sphere_center, radius):
+        return (
+            (drone_pos[0] - sphere_center.request.waypoint.position.x) ** 2
+            + (drone_pos[1] - sphere_center.request.waypoint.position.y) ** 2
+            + (drone_pos[2] - sphere_center.request.waypoint.position.z) ** 2
+        ) <= radius ** 2
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    waypoint_server = WayPointServer()
+    executor = MultiThreadedExecutor()
+    executor.add_node(waypoint_server)
+
+    try:
+        executor.spin()
+    except KeyboardInterrupt:
+        waypoint_server.get_logger().info("KeyboardInterrupt, shutting down.")
+    finally:
+        waypoint_server.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
