@@ -1,0 +1,596 @@
+#!/usr/bin/env python3
+"""
+pico_server.py — one-shot ArUco+CLAHE infection detection + runtime waypoint handler.
+
+Behavior:
+- On startup, listens to /whycon/image_out until a good frame is received (or timeout).
+- Runs Task1A pipeline on that single frame:
+    * ArUco warp -> CLAHE -> split regions -> find most infected cells (P1x / P2x)
+    * Saves debug images to ~/pico_ws/debug_images/
+    * Publishes infected labels once on /infected_labels (std_msgs/String) as CSV: "P1C,P2E"
+- After detection stops, node continues running:
+    * Accepts NavToWaypoint action goals (waypoints provided by waypoint_service)
+    * Flies to each waypoint using existing PID/sphere logic (unchanged)
+    * If an incoming waypoint matches a known PLANT_HOVER coordinate, the server:
+        - Hovers for HOVER_DURATION (inspection)
+        - Then if there's a matching PLANT_SPRAY coordinate, descends to it and holds for SPRAY_DURATION
+- Important: the pico server does NOT compute mission waypoints. It only performs detection once
+  and then responds to waypoints sent by the waypoint service.
+"""
+
+import time
+import math
+from collections import deque
+import os
+import threading
+from pathlib import Path
+
+import cv2
+import numpy as np
+import cv2.aruco as aruco
+from cv_bridge import CvBridge
+from tf_transformations import euler_from_quaternion
+
+import rclpy
+from rclpy.action import ActionServer
+from rclpy.node import Node
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
+
+from waypoint_navigation.action import NavToWaypoint
+from swift_msgs.msg import SwiftMsgs
+from geometry_msgs.msg import PoseArray, Vector3
+from nav_msgs.msg import Odometry
+from sensor_msgs.msg import Image
+from std_msgs.msg import String
+
+# ---------------------- CONFIG ---------------------- #
+DEBUG_DIR = os.path.expanduser("~/pico_ws/debug_images")
+os.makedirs(DEBUG_DIR, exist_ok=True)
+
+HSV_YELLOW_RANGE = (np.array([20, 50, 100]), np.array([35, 255, 255]))
+INFECTED_PERCENTAGE_THRESHOLD = 1.0  # percent
+FIRST_FRAME_TIMEOUT = 12.0  # seconds to wait for first frame
+SPHERE_RADIUS = 0.4
+HOVER_DURATION = 2.0
+SPRAY_DURATION = 2.0
+TASK1A_OUTPUT = os.path.expanduser("~/pico_ws/infected_plants.txt")
+
+# Keep Task1A crop sizes and WIDTH/HEIGHT as original
+WIDTH, HEIGHT = 800, 800
+
+# PLANT HOVER & SPRAY coordinates (used only to *recognize* incoming waypoints,
+# not for mission planning). These must match the waypoint_service coordinates.
+PLANT_HOVER = {
+    "P1A": [4.39, 8.98, 29.29],
+    "P1B": [6.45, 8.79, 28.67],
+    "P1C": [8.62, 8.80, 28.69],
+    "P1D": [4.37, 4.57, 29.19],
+    "P1E": [6.76, 4.49, 28.77],
+    "P1F": [8.70, 4.53, 28.97],
+    "P2A": [4.43, -4.30, 29.74],
+    "P2B": [6.68, -4.30, 29.74],
+    "P2C": [8.93, -4.30, 29.74],
+    "P2D": [4.58, -8.78, 30.62],
+    "P2E": [6.76, -8.61, 30.03],
+    "P2F": [9.17, -8.61, 30.03],
+}
+
+PLANT_SPRAY = {
+    "P1A": [4.5, 8.88, 30.59],
+    "P1B": [6.85, 8.89, 30.62],
+    "P1C": [9.13, 8.80, 30.40],
+    "P1D": [4.53, 4.57, 30.79],
+    "P1E": [6.45, 4.57, 30.79],
+    "P1F": [9.1, 4.53, 28.97],
+    "P2A": [4.43, -4.30, 31.10],
+    "P2B": [7.05, -4.30, 31.52],
+    "P2C": [9.32, -4.30, 31.06],
+    "P2D": [4.53, -8.59, 30.76],
+    "P2E": [7.05, -8.81, 31.52],
+    "P2F": [9.08, -8.92, 31.93],
+}
+
+# small tolerance to match incoming waypoint x,y to known plant points
+PLANT_MATCH_TOL = 0.20
+
+
+# ---------------------- Task1A Helpers (copied/adapted) ---------------------- #
+def find_and_warp_aruco(image):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    gray = clahe.apply(gray)
+
+    aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_100)
+    parameters = aruco.DetectorParameters_create()
+
+    parameters.cornerRefinementMethod = aruco.CORNER_REFINE_SUBPIX
+    parameters.adaptiveThreshWinSizeMin = 3
+    parameters.adaptiveThreshWinSizeMax = 23
+    parameters.adaptiveThreshWinSizeStep = 2
+    parameters.adaptiveThreshConstant = 5
+
+    corners, ids, _ = aruco.detectMarkers(gray, aruco_dict, parameters=parameters)
+
+    if ids is None or len(ids) < 4:
+        raise RuntimeError("Need at least 4 ArUco markers.")
+
+    aruco.drawDetectedMarkers(image, corners, ids)
+
+    centers = np.array([c[0].mean(axis=0) for c in corners])
+    sums = centers.sum(axis=1)
+    diffs = np.diff(centers, axis=1)
+
+    top_left_idx, bottom_right_idx = np.argmin(sums), np.argmax(sums)
+    top_right_idx, bottom_left_idx = np.argmax(diffs), np.argmin(diffs)
+
+    pts_src = np.zeros((4, 2), dtype=np.float32)
+    pts_src[0] = corners[top_left_idx][0][0]
+    pts_src[1] = corners[top_right_idx][0][1]
+    pts_src[2] = corners[bottom_right_idx][0][2]
+    pts_src[3] = corners[bottom_left_idx][0][3]
+
+    pts_dst = np.array([[0, 0], [WIDTH - 1, 0], [WIDTH - 1, HEIGHT - 1], [0, HEIGHT - 1]], dtype=np.float32)
+    M = cv2.getPerspectiveTransform(pts_src, pts_dst)
+    warped = cv2.warpPerspective(image, M, (WIDTH, HEIGHT))
+
+    return warped, ids.flatten()
+
+
+def find_soil_area(half_image):
+    if half_image.size == 0:
+        return 0
+    hsv = cv2.cvtColor(half_image, cv2.COLOR_BGR2HSV)
+    lower_brown = np.array([10, 50, 20])
+    upper_brown = np.array([30, 255, 200])
+    soil_mask = cv2.inRange(hsv, lower_brown, upper_brown)
+    return np.sum(soil_mask)
+
+
+def apply_clahe(image):
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    cl = clahe.apply(l)
+    return cv2.cvtColor(cv2.merge((cl, a, b)), cv2.COLOR_LAB2BGR)
+
+
+def analyze_region_infection(region_image, prefix="P1"):
+    h, w, _ = region_image.shape
+    block_h, block_w = h // 3, w // 2
+    labels = [["A", "D"], ["B", "E"], ["C", "F"]]
+    infection_scores = []
+    visual = region_image.copy()
+
+    for c in range(2):
+        for r in range(3):
+            cell = region_image[r * block_h:(r + 1) * block_h, c * block_w:(c + 1) * block_w]
+            label = labels[r][c]
+            hsv = cv2.cvtColor(cell, cv2.COLOR_BGR2HSV)
+            mask = cv2.inRange(hsv, HSV_YELLOW_RANGE[0], HSV_YELLOW_RANGE[1])
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            score = 0
+            if contours:
+                score = max([cv2.contourArea(cnt) for cnt in contours])
+                cv2.drawContours(cell, contours, -1, (0, 255, 255), 1)
+
+            cv2.rectangle(visual, (c * block_w, r * block_h),
+                          ((c + 1) * block_w, (r + 1) * block_h), (255, 0, 0), 2)
+            cv2.putText(visual, f"{prefix}{label}", (c * block_w + 10, r * block_h + 25),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            infection_scores.append((label, score))
+
+    if not infection_scores:
+        return "N/A", visual
+
+    most_infected = max(infection_scores, key=lambda x: x[1])[0]
+
+    for c in range(2):
+        for r in range(3):
+            if labels[r][c] == most_infected:
+                cv2.rectangle(visual, (c * block_w, r * block_h),
+                              ((c + 1) * block_w, (r + 1) * block_h), (0, 0, 255), 4)
+    return most_infected, visual
+
+
+# ---------------------- Pico server Node ---------------------- #
+class WayPointServer(Node):
+    def __init__(self):
+        super().__init__("waypoint_server")
+
+        # callback groups
+        self.pid_or_lqr_callback_group = ReentrantCallbackGroup()
+        self.action_callback_group = ReentrantCallbackGroup()
+
+        # state vectors
+        self.current_state = [0.0, 0.0, 0.0, 0.0]
+        self.desired_state = [0.0, 0.0, 0.0, 0.0]
+
+        # rc command
+        self.cmd = SwiftMsgs()
+        self.cmd.rc_roll = 1500
+        self.cmd.rc_pitch = 1500
+        self.cmd.rc_yaw = 1500
+        self.cmd.rc_throttle = 1400
+
+        # moving average filter
+        self.ma_window = 18
+        self.ma_x = deque(maxlen=self.ma_window)
+        self.ma_y = deque(maxlen=self.ma_window)
+        self.ma_z = deque(maxlen=self.ma_window)
+
+        # PID gains (as before)
+        self.Kp = [14.0, 14.0, 16.5, 0]
+        self.Ki = [0.000000008, 0.000000008, 1, 0]
+        self.Kd = [22.0, 22.0, 32.4, 0]
+
+        self.prev_error = [0.0, 0.0, 0.0]
+        self.error_sum = [0.0, 0.0, 0.0]
+        self.diff_x = 0.0
+        self.diff_y = 0.0
+        self.diff_z = 0.0
+
+        self.sample_time = 0.00866
+        self.last_time = self.get_clock().now().nanoseconds / 1e9
+
+        # publishers & subscribers
+        self.command_pub = self.create_publisher(SwiftMsgs, "/drone_command", 10)
+        self.detect_pub = self.create_publisher(String, "/infected_plant_detected", 10)
+        self.infected_pub = self.create_publisher(String, "/infected_labels", 10)
+        self.movingAvgPublisher = self.create_publisher(Vector3, "/moving_average/pose", 10)
+
+        self.whycon_sub = self.create_subscription(PoseArray, "/whycon/poses", self.whycon_callback, 10)
+        self.odom_sub = self.create_subscription(Odometry, "/rotors/odometry", self.odometry_callback, 10)
+        self.image_sub = self.create_subscription(Image, "/whycon/image_out", self.image_callback, 10)
+
+        self.bridge = CvBridge()
+        self.current_frame = None
+
+        # detection state
+        self.detected_labels = []   # list of strings like "P1C"
+        self._detection_done = threading.Event()
+
+        self.is_stabilizing = False
+
+        # action server (preserve original execute behavior)
+        self._action_server = ActionServer(
+            self,
+            NavToWaypoint,
+            "waypoint_navigation",
+            self.execute_callback,
+            callback_group=self.action_callback_group
+        )
+
+        # arm motors & start PID loop
+        self.arm()
+        self.timer = self.create_timer(self.sample_time, self.pid, callback_group=self.pid_or_lqr_callback_group)
+
+        # start detection thread (runs once)
+        t = threading.Thread(target=self.preflight_detection, daemon=True)
+        t.start()
+
+    # ---------------- basic rc helpers ---------------- #
+    def disarm(self):
+        self.cmd.rc_roll = 1000
+        self.cmd.rc_pitch = 1000
+        self.cmd.rc_yaw = 1000
+        self.cmd.rc_throttle = 1000
+        self.cmd.rc_aux4 = 1000
+        self.command_pub.publish(self.cmd)
+
+    def arm(self):
+        self.disarm()
+        self.cmd.rc_roll = 1500
+        self.cmd.rc_pitch = 1500
+        self.cmd.rc_yaw = 1500
+        self.cmd.rc_throttle = 1500
+        self.cmd.rc_aux4 = 2000
+        self.command_pub.publish(self.cmd)
+
+    # ---------------- subscriptions --------------------- #
+    def whycon_callback(self, msg):
+        if not msg.poses:
+            return
+        p = msg.poses[0]
+        self.ma_x.append(p.position.x)
+        self.ma_y.append(p.position.y)
+        self.ma_z.append(p.position.z)
+
+        fx = sum(self.ma_x) / len(self.ma_x)
+        fy = sum(self.ma_y) / len(self.ma_y)
+        fz = sum(self.ma_z) / len(self.ma_z)
+
+        self.current_state[0] = 0.2 * fx + 0.8 * self.current_state[0]
+        self.current_state[1] = 0.2 * fy + 0.8 * self.current_state[1]
+        self.current_state[2] = 0.4 * fz + 0.6 * self.current_state[2]
+
+        self.movingAvgPublisher.publish(Vector3(x=self.current_state[0], y=self.current_state[1], z=self.current_state[2]))
+
+    def odometry_callback(self, msg):
+        q = msg.pose.pose.orientation
+        roll, pitch, yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])
+        self.roll_deg = math.degrees(roll)
+        self.pitch_deg = math.degrees(pitch)
+        self.yaw_deg = math.degrees(yaw)
+
+    def image_callback(self, msg):
+        try:
+            frame = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+            self.current_frame = frame
+        except Exception:
+            pass
+
+    # ---------------- Task1A detection (runs once at startup) ------------- #
+    def preflight_detection(self):
+        self.get_logger().info("[DETECT] Waiting for first frame from /whycon/image_out...")
+        start = time.time()
+        while self.current_frame is None and (time.time() - start) < FIRST_FRAME_TIMEOUT and rclpy.ok():
+            time.sleep(0.05)
+
+        if self.current_frame is None:
+            self.get_logger().warn("[DETECT] No frame received within timeout. Publishing NONE and finishing detection.")
+            self.infected_pub.publish(String(data="NONE"))
+            self._detection_done.set()
+            return
+
+        frame = self.current_frame.copy()
+
+        # run ArUco warp + detection pipeline
+        try:
+            warped_arena, ids = find_and_warp_aruco(frame.copy())
+        except Exception as e:
+            self.get_logger().error(f"[DETECT] ArUco detection failed: {e}. Publishing NONE.")
+            self.infected_pub.publish(String(data="NONE"))
+            self._detection_done.set()
+            return
+
+        warped_arena = cv2.flip(warped_arena, 1)
+        mid_y = warped_arena.shape[0] // 2
+        top_half, bottom_half = warped_arena[:mid_y, :], warped_arena[mid_y:, :]
+
+        if find_soil_area(bottom_half) > find_soil_area(top_half):
+            plant_area_half = top_half
+            self.get_logger().info("🌱 Plant trays identified in the BOTTOM half.")
+        else:
+            plant_area_half = bottom_half
+            self.get_logger().info("🌱 Plant trays identified in the TOP half.")
+
+        left_region = plant_area_half[66:333, 110:341]
+        right_region = plant_area_half[66:333, 460:690]
+
+        left_enhanced = apply_clahe(left_region)
+        right_enhanced = apply_clahe(right_region)
+
+        most_infected_b1, vis1 = analyze_region_infection(left_enhanced, "P1")
+        most_infected_b2, vis2 = analyze_region_infection(right_enhanced, "P2")
+
+        labels = []
+        if most_infected_b1 != "N/A":
+            labels.append(f"P1{most_infected_b1}")
+        if most_infected_b2 != "N/A":
+            labels.append(f"P2{most_infected_b2}")
+
+        self.detected_labels = labels
+
+        # save debug images
+        ts = int(time.time())
+        try:
+            cv2.imwrite(os.path.join(DEBUG_DIR, f"warped_{ts}.png"), warped_arena)
+            cv2.imwrite(os.path.join(DEBUG_DIR, f"P1_vis_{ts}.png"), vis1)
+            cv2.imwrite(os.path.join(DEBUG_DIR, f"P2_vis_{ts}.png"), vis2)
+            self.get_logger().info(f"[DETECT] Debug images saved to {DEBUG_DIR}")
+        except Exception as e:
+            self.get_logger().warn(f"[DETECT] Failed to save debug images: {e}")
+
+        # publish and optionally save results
+        if labels:
+            csv = ",".join(labels)
+            self.get_logger().info(f"[DETECT] Infected plant labels detected: {labels}")
+            try:
+                Path(TASK1A_OUTPUT).parent.mkdir(parents=True, exist_ok=True)
+                with open(TASK1A_OUTPUT, "w") as f:
+                    for L in labels:
+                        f.write(L + "\n")
+                self.get_logger().info(f"[DETECT] Detection results saved to {TASK1A_OUTPUT}")
+            except Exception as e:
+                self.get_logger().warn(f"[DETECT] Could not write {TASK1A_OUTPUT}: {e}")
+            # publish on topic
+            self.infected_pub.publish(String(data=csv))
+        else:
+            self.get_logger().info("[DETECT] No infected plant detected by Task1A.")
+            self.infected_pub.publish(String(data="NONE"))
+
+        self._detection_done.set()
+        self.get_logger().info("[DETECT] Preflight detection finished.")
+
+    # ---------------- PID (unchanged) ----------------- #
+    def pid(self):
+        now = self.get_clock().now().nanoseconds / 1e9
+        dt = now - self.last_time
+        if dt <= 0:
+            dt = self.sample_time
+        self.last_time = now
+
+        def compute_pid(axis, desired, current, prev, isum, diff_prev):
+            error = desired - current
+            diff = 0.7 * (error - prev) / dt
+            isum += error * dt
+            output = self.Kp[axis] * error + self.Ki[axis] * isum + self.Kd[axis] * diff
+            return output, error, isum, diff_prev
+
+        throttle_output, self.prev_error[2], self.error_sum[2], _ = compute_pid(
+            2, self.desired_state[2] - 0.1, self.current_state[2],
+            self.prev_error[2], self.error_sum[2], self.diff_z
+        )
+
+        pitch_output, self.prev_error[0], self.error_sum[0], _ = compute_pid(
+            0, self.desired_state[0], self.current_state[0],
+            self.prev_error[0], self.error_sum[0], self.diff_y
+        )
+
+        roll_output, self.prev_error[1], self.error_sum[1], _ = compute_pid(
+            1, self.current_state[1], self.desired_state[1],
+            self.prev_error[1], self.error_sum[1], self.diff_x
+        )
+
+        BASE_THR = 1535
+        rc_throttle = int(BASE_THR - throttle_output)
+        rc_throttle = max(1480, min(1650, rc_throttle))
+
+        self.cmd.rc_throttle = rc_throttle
+        self.cmd.rc_pitch = int(1500 + pitch_output)
+        self.cmd.rc_roll = int(1500 - roll_output)
+
+        self.command_pub.publish(self.cmd)
+
+    # ---------------- helper actions ----------------- #
+    def hover_action(self, label, duration):
+        self.get_logger().info(f"[ACTION] Hovering for {duration}s → {label}")
+        t0 = time.time()
+        while time.time() - t0 < duration:
+            time.sleep(0.05)
+        self.get_logger().info(f"[ACTION] Hover complete → {label}")
+
+    def is_drone_in_sphere(self, drone_pos, target_xyz, radius):
+        gx, gy, gz = target_xyz
+        return ((drone_pos[0] - gx) ** 2 + (drone_pos[1] - gy) ** 2 + (drone_pos[2] - gz) ** 2) <= radius ** 2
+
+    # ---------------- execute callback (keeps original behavior) ----------------- #
+    def execute_callback(self, goal_handle):
+        goal = goal_handle.request.waypoint
+        self.desired_state[0] = goal.position.x
+        self.desired_state[1] = goal.position.y
+        self.desired_state[2] = goal.position.z
+
+        q = goal.orientation
+        _, _, yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])
+        self.desired_state[3] = yaw
+
+        x, y, z = self.desired_state[:3]
+
+        STAB = [(-9.11, 9.27, 31.27), (-9.07, 9.23, 32.57)]
+
+        def near(a, b):
+            return math.dist(a, b) < 0.4
+
+        a = (x, y, z)
+        do_stab = any(near(a, p) for p in STAB)
+
+        stable_start = None
+
+        while rclpy.ok():
+            inside = self.is_drone_in_sphere(self.current_state, (x, y, z), SPHERE_RADIUS)
+
+            if inside:
+                if do_stab:
+                    if stable_start is None:
+                        stable_start = time.time()
+                        self.get_logger().info("[STABILITY] Drone inside sphere → starting 2.3s timer")
+                        self.is_stabilizing = True
+                    elapsed = time.time() - stable_start
+                    self.get_logger().info(f"[STABILITY] {elapsed:.2f} / 2.3s")
+                    if elapsed >= 2.3:
+                        break
+                else:
+                    break
+            else:
+                stable_start = None
+                self.is_stabilizing = False
+            time.sleep(0.05)
+
+        self.is_stabilizing = False
+        self.get_logger().info("[NAV] Reached waypoint successfully")
+
+        # ---------- If this waypoint matches a PLANT_HOVER coordinate, run hover+spray sequence ----------
+        matched_label = None
+        for lbl, coord in PLANT_HOVER.items():
+            if abs(coord[0] - x) <= PLANT_MATCH_TOL and abs(coord[1] - y) <= PLANT_MATCH_TOL:
+                matched_label = lbl
+                break
+
+            if matched_label is not None:
+                # Hover (inspection)
+                self.get_logger().info(
+                    f"[PLANT] Waypoint matches hover point for {matched_label}. Hovering for {HOVER_DURATION}s..."
+                )
+                self.hover_action(matched_label, HOVER_DURATION)
+
+                spray_coord = PLANT_SPRAY.get(matched_label)
+                if spray_coord:
+
+                    # -----------------------------------------------------------
+                    # 🔧 FIX C — Continuous XY Correction + Slow Vertical Descent
+                    # -----------------------------------------------------------
+                    self.get_logger().info("[PLANT] Starting smart descent with XY correction...")
+
+                    target_x, target_y, target_z = spray_coord
+
+                    while rclpy.ok():
+
+                        # XY correction every cycle
+                        self.desired_state[0] = target_x
+                        self.desired_state[1] = target_y
+
+                        current_z = self.current_state[2]
+                        dz = target_z - current_z
+
+                        # Small step descent (20–30% per loop)
+                        self.desired_state[2] = current_z-0.1 + dz * 0.25
+
+                        # Stop when close enough to final Z
+                        if abs(dz) < 0.05:
+                            break
+
+                        time.sleep(0.05)
+
+                    # Snap final Z
+                    self.desired_state[0] = target_x
+                    self.desired_state[1] = target_y
+                    self.desired_state[2] = target_z
+
+                    # Final wait inside spray sphere
+                    t0 = time.time()
+                    while rclpy.ok() and (time.time() - t0) < 10.0:
+                        if self.is_drone_in_sphere(self.current_state, tuple(spray_coord), SPHERE_RADIUS):
+                            break
+                        time.sleep(0.05)
+
+                    # Spray hold
+                    self.get_logger().info(f"[PLANT] Holding spray for {SPRAY_DURATION}s...")
+                    time.sleep(SPRAY_DURATION)
+
+
+            else:
+                self.get_logger().warn(f"[PLANT] No spray coordinate found for {matched_label}")
+
+        # publish a simple detection message on /infected_plant_detected if desired (keeps older behavior)
+        # (we don't publish the full list here, just a notification)
+        try:
+            self.detect_pub.publish(String(data="Waypoint reached"))
+        except Exception:
+            pass
+
+        # complete action
+        goal_handle.succeed()
+        return NavToWaypoint.Result()
+
+
+# ---------------------- entrypoint ---------------------- #
+def main(args=None):
+    rclpy.init(args=args)
+    node = WayPointServer()
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
+
+    try:
+        executor.spin()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        # proper cleanup
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
