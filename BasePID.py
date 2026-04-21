@@ -85,7 +85,6 @@ class WayPointServer(Node):
 
         # Control loop
         self.control_timer = self.create_timer(self.sample_time, self.pid)
-        self.get_logger().info("🧭 Stable Swift Pico Controller started (fixed hover timing)")
 
         # Arm the drone
         self.arm()
@@ -101,7 +100,6 @@ class WayPointServer(Node):
         self.cmd.rc_roll = self.cmd.rc_pitch = self.cmd.rc_yaw = self.cmd.rc_throttle = 1500
         self.cmd.rc_aux4 = 2000
         self.command_pub.publish(self.cmd)
-        self.get_logger().info("Drone armed ✅")
 
     # ------------------- CALLBACKS -------------------
     def whycon_callback(self, msg: PoseArray):
@@ -169,7 +167,6 @@ class WayPointServer(Node):
             if in_sphere:
                 if hover_start_time is None:
                     hover_start_time = self.get_clock().now().nanoseconds / 1e9
-                    self.get_logger().info("🟢 Drone entered hover sphere for the first time.")
                 else:
                     hover_duration = (
                             (self.get_clock().now().nanoseconds / 1e9) - hover_start_time
@@ -184,13 +181,13 @@ class WayPointServer(Node):
                         )
                         result.hov_time = hover_duration
                         self.get_logger().info(
-                            f"✅ Hovered for {hover_duration:.2f}s (Total time: {total_time:.2f}s)."
+                            f"Hovered for {hover_duration:.2f}s (Total time: {total_time:.2f}s)."
                         )
                         goal_handle.succeed()
                         return result
             else:
                 if hover_start_time is not None:
-                    self.get_logger().info("🔴 Drone exited hover sphere.")
+                    self.get_logger().info("Drone exited hover sphere.")
                     hover_start_time = None
 
             time.sleep(0.1)
