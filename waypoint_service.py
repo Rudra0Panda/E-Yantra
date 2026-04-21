@@ -35,7 +35,7 @@ class WayPoints(Node):
                 response.waypoints.poses[i].position.y = y
                 response.waypoints.poses[i].position.z = z
 
-            self.get_logger().info("✅ Sent waypoints successfully.")
+            self.get_logger().info("Sent waypoints successfully.")
         else:
            response.waypoints.poses = [Pose() for _ in range(len(self.waypoints))]
 
@@ -54,7 +54,7 @@ def main():
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        node.get_logger().info('🛑 KeyboardInterrupt, shutting down...')
+        node.get_logger().info('KeyboardInterrupt, shutting down...')
     finally:
         node.destroy_node()
         rclpy.shutdown()
